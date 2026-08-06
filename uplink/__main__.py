@@ -4,6 +4,7 @@
     python -m uplink search "question"   [--db PATH] [--k N] [--json]
     python -m uplink eval   <fixtures>   [--db PATH] [--k N] [--json] [--log]
     python -m uplink report <kind|all>   [--db PATH] [--out DIR] [--fixtures F]
+    python -m uplink serve               [--db PATH] [--host H] [--port N]
     python -m uplink status              [--db PATH]
 
 `search` and `eval` open the database read-only. Stdout is reconfigured to
@@ -76,6 +77,15 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="Show index statistics (read-only).")
     p_status.add_argument("--db", default=str(DEFAULT_DB))
 
+    p_serve = sub.add_parser("serve", help="Run the local web UI (read-only).")
+    p_serve.add_argument("--db", default=str(DEFAULT_DB))
+    p_serve.add_argument(
+        "--host", default="127.0.0.1",
+        help="Bind address. Default localhost-only; widen deliberately (e.g. a Tailscale IP).",
+    )
+    p_serve.add_argument("--port", type=int, default=8180)
+    p_serve.add_argument("--reports", default="reports", help="Directory of generated reports.")
+
     args = parser.parse_args(argv)
 
     try:
@@ -87,6 +97,11 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_eval(args)
         if args.cmd == "report":
             return _cmd_report(args)
+        if args.cmd == "serve":
+            from .webapp import serve
+
+            serve(args.db, args.host, args.port, args.reports)
+            return 0
         if args.cmd == "status":
             return _cmd_status(args)
     except (OSError, ValueError) as exc:

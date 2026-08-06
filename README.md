@@ -59,6 +59,8 @@ AI operating system.
   narrates.
 - `uplink/svgchart.py` — dependency-free SVG charts (theme-aware via CSS
   custom properties; light and dark).
+- `uplink/webapp.py` — the local web UI: stdlib HTTP server, JSON search
+  API, zero frameworks, read-only.
 
 ## Install
 
@@ -82,8 +84,19 @@ python -m uplink search "when do backups run" --json    # for LLM consumption
 python -m uplink eval   fixtures/golden.jsonl           # measure retrieval
 python -m uplink eval   fixtures/golden.jsonl --log --label "baseline"
 python -m uplink report all --fixtures fixtures/golden.jsonl --out reports
+python -m uplink serve                                   # web UI at localhost:8180
 python -m uplink status                                  # index statistics
 ```
+
+## Web UI
+
+`python -m uplink serve` starts a stdlib-only local web app: a search box
+over your corpus with cited results (`path > section`), match highlighting,
+an index status line, and links to the generated reports. Read-only by
+construction (no write endpoints, SQLite `mode=ro`), corpus text rendered
+via `textContent` only (document content can never inject markup), and bound
+to `127.0.0.1` unless you widen it deliberately (`--host <tailscale-ip>` to
+reach it from your phone on your tailnet).
 
 The index lives at `data/index.db` by default (`--db` to override) and is
 never committed — it may contain private corpus content.
