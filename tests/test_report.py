@@ -85,6 +85,8 @@ def test_quality_report_with_history(small_index, tmp_path: Path):
             {"questions": 1, "hit_at_1": 1, "hit_at_k": 1, "k": 5, "mrr": 0.5 + i * 0.1},
             NOW,
             label=f"run{i}",
+            db=db_path,
+            fixtures=fixtures,
         )
     data = quality_data(db_path, fixtures, history)
     assert data["summary"]["hit_at_k"] == 1
@@ -225,8 +227,10 @@ def test_quality_history_with_mismatched_k_gaps_not_mixes(small_index, tmp_path:
         encoding="utf-8",
     )
     history = tmp_path / "hist.jsonl"
-    append_history(history, {"questions": 1, "hit_at_1": 1, "hit_at_k": 1, "k": 10, "mrr": 1.0}, NOW)
-    append_history(history, {"questions": 1, "hit_at_1": 1, "hit_at_k": 1, "k": 5, "mrr": 1.0}, NOW)
+    append_history(history, {"questions": 1, "hit_at_1": 1, "hit_at_k": 1, "k": 10, "mrr": 1.0},
+                   NOW, db=db_path, fixtures=fixtures)
+    append_history(history, {"questions": 1, "hit_at_1": 1, "hit_at_k": 1, "k": 5, "mrr": 1.0},
+                   NOW, db=db_path, fixtures=fixtures)
     ctx = _ctx(db_path, tmp_path, fixtures=fixtures, history=history)
     (page,) = render_all(ctx, ["quality"])
     text = page.read_text(encoding="utf-8")

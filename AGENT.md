@@ -20,22 +20,29 @@ answers, and narrates. The model never touches the database directly.
 
 ```
 python -m uplink search "<question>" --db <path> --k 8 --json
+python -m uplink search "<question>" --collection finance --json
 ```
 
 Returns a JSON array (best match first):
 
 ```json
 [{
-  "path":     "context/goals.md",
-  "title":    "Goals - Q3 2026",
-  "filetype": "md",
-  "section":  "Main Q3 Goal",
-  "seq":      3,
-  "score":    12.41,
-  "snippet":  "...working deadline is [September] [30]...",
-  "text":     "full chunk text, truncated to 1200 chars"
+  "path":       "context/goals.md",
+  "title":      "Goals - Q3 2026",
+  "filetype":   "md",
+  "collection": "main",
+  "section":    "Main Q3 Goal",
+  "seq":        3,
+  "score":      12.41,
+  "snippet":    "...working deadline is September 30...",
+  "text":       "full chunk text, truncated to 1200 chars"
 }]
 ```
+
+Matched spans in `snippet` are delimited by the non-printable characters
+U+0001 / U+0002 (so corpus text containing `[` `]` stays intact) — strip
+or restyle them before showing a human. The plain (non-`--json`) CLI output
+renders them as `[` `]` for the console.
 
 Answer workflow: run search, read `text` of the top hits, compose the answer,
 cite `path > section` per claim. Prefer 2-3 strong chunks over all 8.
@@ -43,11 +50,14 @@ cite `path > section` per claim. Prefer 2-3 strong chunks over all 8.
 ### Refresh the index (only on request)
 
 ```
-python -m uplink index <corpus_dir> --db <path>
+python -m uplink index <corpus_dir> --db <path> --collection <name>
 ```
 
-One database belongs to one corpus root; indexing a different root into the
-same database is refused (`CorpusMismatch`). Use one `--db` per corpus.
+Collections partition one organization's database (departments, industries);
+each collection is bound to one corpus root, and indexing a different root
+into it is refused (`CorpusMismatch`). Separate clients get separate `--db`
+files — never mix client corpora in one database. A v0.1 database says
+`upgrade` when opened; run `python -m uplink upgrade --db <path>` once.
 
 ### Measure retrieval quality
 
@@ -75,6 +85,24 @@ Narrative workflow:
 Narrative text is HTML-escaped on render — plain prose only, no markup.
 Reports land in `reports/` (gitignored: generated reports contain corpus
 content and are never committed or published).
+
+### The web app (context, not a model surface)
+
+`python -m uplink serve` exposes the same read-only search as
+`GET /api/search?q=&k=&collection=` and `GET /api/status`. Upload and
+feedback endpoints exist only while the server is bound to localhost; bound
+wider (Tailscale), the surface is ask-only. The model normally uses the CLI,
+not the web API.
+
+### Promote feedback into fixtures (only on request)
+
+```
+python -m uplink promote            # data/feedback.jsonl -> fixtures/promoted.jsonl
+```
+
+Thumbs-up votes from the web UI become golden-question fixtures (last vote
+per question/path wins; downvotes are never promoted). Review promoted
+fixtures before merging them into a scored fixture set.
 
 ## Error contract
 

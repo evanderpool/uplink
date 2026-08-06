@@ -39,9 +39,13 @@ class Hit:
     path: str
     title: str
     filetype: str
+    collection: str
     section: str
     seq: int
     score: float
+    # Matched spans are delimited with \x01 ... \x02 — non-printable
+    # characters that cannot occur as content (unlike '[' and ']', which
+    # every Markdown link contains and which corrupted highlighting).
     snippet: str
     text: str
 
@@ -63,12 +67,19 @@ def build_match(query: str, mode: str = "and") -> str | None:
     return joiner.join(quoted)
 
 
-def search(db_path: str | Path, query: str, k: int = 8, max_text: int = 1200) -> list[Hit]:
+def search(
+    db_path: str | Path,
+    query: str,
+    k: int = 8,
+    max_text: int = 1200,
+    collection: str | None = None,
+) -> list[Hit]:
+    """Search the index; `collection=None` searches every collection."""
     conn = db.connect_ro(db_path)
     try:
-        rows = _run(conn, build_match(query, "and"), k)
+        rows = _run(conn, build_match(query, "and"), k, collection)
         if not rows:
-            rows = _run(conn, build_match(query, "or"), k)
+            rows = _run(conn, build_match(query, "or"), k, collection)
         hits = []
         for row in rows:
             text = row["text"]
@@ -77,6 +88,7 @@ def search(db_path: str | Path, query: str, k: int = 8, max_text: int = 1200) ->
                     path=row["path"],
                     title=row["title"],
                     filetype=row["filetype"],
+                    collection=row["collection"],
                     section=row["section"] or "",
                     seq=row["seq"],
                     score=round(-row["rank"], 4),  # bm25() is lower-is-better
@@ -89,22 +101,28 @@ def search(db_path: str | Path, query: str, k: int = 8, max_text: int = 1200) ->
         conn.close()
 
 
-def _run(conn: sqlite3.Connection, match: str | None, k: int):
+def _run(conn: sqlite3.Connection, match: str | None, k: int, collection: str | None):
     if not match:
         return []
+    where = "chunks_fts MATCH ?"
+    params: list = [match]
+    if collection is not None:
+        where += " AND d.collection = ?"
+        params.append(collection)
+    params.append(k)
     return conn.execute(
-        """
-        SELECT d.path, d.title, d.filetype, c.section, c.seq, c.text,
+        f"""
+        SELECT d.path, d.title, d.filetype, d.collection, c.section, c.seq, c.text,
                bm25(chunks_fts, 1.0, 3.0) AS rank,
-               snippet(chunks_fts, 0, '[', ']', ' ... ', 24) AS snip
+               snippet(chunks_fts, 0, char(1), char(2), ' ... ', 24) AS snip
         FROM chunks_fts
         JOIN chunks c ON c.id = chunks_fts.rowid
         JOIN documents d ON d.id = c.doc_id
-        WHERE chunks_fts MATCH ?
+        WHERE {where}
         ORDER BY bm25(chunks_fts, 1.0, 3.0)
         LIMIT ?
         """,
-        (match, k),
+        params,
     ).fetchall()
 
 

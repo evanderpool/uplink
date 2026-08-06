@@ -60,7 +60,12 @@ AI operating system.
 - `uplink/svgchart.py` — dependency-free SVG charts (theme-aware via CSS
   custom properties; light and dark).
 - `uplink/webapp.py` — the local web UI: stdlib HTTP server, JSON search
-  API, zero frameworks, read-only.
+  API, zero frameworks; writes (upload, feedback) exist only on a loopback
+  bind.
+- `uplink/feedback.py` — the query log, thumbs feedback, and the
+  feedback→fixture promotion loop.
+- `uplink/export.py` — JSONL export of documents+chunks (the migration path
+  to a future vector store).
 
 ## Install
 
@@ -78,27 +83,62 @@ pip install -e ".[dev]"     # everything + pytest
 ## Use
 
 ```
-python -m uplink index  "C:\path\to\your\docs"          # build/refresh index
-python -m uplink search "when do backups run" --k 5     # human output
-python -m uplink search "when do backups run" --json    # for LLM consumption
-python -m uplink eval   fixtures/golden.jsonl           # measure retrieval
+python -m uplink index  "C:\path\to\your\docs" --collection ops   # build/refresh
+python -m uplink search "when do backups run" --k 5               # human output
+python -m uplink search "when do backups run" --json              # for LLM consumption
+python -m uplink search "q1 budget" --collection finance          # scope to one collection
+python -m uplink eval   fixtures/golden.jsonl                     # measure retrieval
 python -m uplink eval   fixtures/golden.jsonl --log --label "baseline"
 python -m uplink report all --fixtures fixtures/golden.jsonl --out reports
-python -m uplink serve                                   # web UI at localhost:8180
-python -m uplink status                                  # index statistics
+python -m uplink serve                                            # web UI at localhost:8180
+python -m uplink status                                           # index statistics
+python -m uplink export --collection ops --out ops.jsonl          # docs+chunks as JSONL
+python -m uplink promote                                          # feedback -> fixtures
+python -m uplink upgrade --db old.db                              # v0.1 -> collections schema
 ```
+
+## Collections
+
+Since v0.2 every document belongs to a named **collection** — a department or
+industry inside one organization (`ops`, `finance`, `health`, …). Collections
+share one database and one search surface (filter with `--collection` or the
+web UI's picker); **separate clients get separate database files**, keeping
+the client privacy boundary a filesystem boundary rather than a WHERE clause.
+Each collection is bound to one source folder; indexing a different folder
+into it is refused rather than silently purging its documents.
+
+Public-domain test corpora (SEC 10-Ks, CDC guidelines, NIST publications) can
+be fetched with `python scripts/fetch_corpora.py` and indexed as `finance` /
+`health` / `tech` collections — `fixtures/industry-golden.jsonl` scores
+retrieval over them.
 
 ## Web UI
 
 `python -m uplink serve` starts a stdlib-only local web app: a search box
-over your corpus with cited results (`path > section`), match highlighting,
-an index status line, and links to the generated reports. Read-only by
-construction (no write endpoints, SQLite `mode=ro`), corpus text rendered
-via `textContent` only (document content can never inject markup), and bound
-to `127.0.0.1` unless you widen it deliberately (`--host <tailscale-ip>` to
-reach it from your phone on your tailnet).
+over your corpus with cited results (`path > section`), a collection picker,
+match highlighting, per-query latency, and links to the generated reports.
 
-The index lives at `data/index.db` by default (`--db` to override) and is
+**The localhost-only write rule:** upload and thumbs-feedback endpoints exist
+only while the server is bound to a loopback address (the default). Bound to
+anything wider — `--host <tailscale-ip>` to reach it from your phone — every
+write returns 403 and the controls never render: the remote surface is
+ask-only by construction, not by convention. Search connections stay SQLite
+`mode=ro` either way; the only database writes go through the same indexer
+the CLI uses.
+
+Browser-borne attacks are closed off separately: the Host header must name
+the server or be an IP literal (defeats DNS rebinding), and write POSTs
+require the custom `X-Uplink` header plus a loopback Origin (defeats CSRF).
+Uploads are constrained by extension whitelist, size cap, sanitized bare
+filenames, and land only in `data/uploads/<collection>/` — never in a
+folder-bound collection's source folder.
+
+Thumbs feedback accumulates in `data/feedback.jsonl`; `python -m uplink
+promote` turns thumbs-up votes (last vote wins) into golden-question
+fixtures, so the eval suite grows from real usage. Every web search is
+logged to `data/query-log.jsonl` with hit count and latency.
+
+The index lives at `data/uplink.db` by default (`--db` to override) and is
 never committed — it may contain private corpus content.
 
 ## Measured retrieval quality
@@ -117,6 +157,12 @@ in review as too lenient.
 The two remaining misses are vocabulary-mismatch questions (the question's
 words don't appear in the answering document) — the documented motivation for
 phase 2.
+
+On the public-domain industry corpora (10 documents, 4,661 chunks — SEC
+10-Ks, CDC infection-control guidelines, NIST security publications;
+`fixtures/industry-golden.jsonl`, 13 questions): **hit@1 92% / hit@5 92% /
+MRR 0.923**, one vocabulary-mismatch miss. Reproducible with
+`scripts/fetch_corpora.py` + three `index --collection` commands.
 
 ## Reports
 
@@ -145,6 +191,8 @@ content, so the capability is public but your outputs are not.
 | SQLite over a vector DB service | Zero services to run; FTS5 is stdlib; the schema is inspectable SQL |
 | CLI, not a daemon | No port, no lifecycle, no auth surface — the LLM session invokes a process |
 | Read-only search connections | "The query path can't write" is enforced by SQLite, not by convention |
+| Localhost-only writes | Whether writes exist is decided by the bind address at startup, not by request-time checks an attacker might route around |
+| Collections in one DB, clients in separate DBs | Departments share a search surface; client isolation is a filesystem boundary, not a WHERE clause |
 | Eval fixtures in-repo | The harness runs against any corpus with one command; the numbers above come from a corpus in a separate (public) repo, so treat them as our measurement, reproducible with that repo cloned |
 
 ## Tests
@@ -153,14 +201,18 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite covers every extractor (including a byte-level generated PDF — no
-PDF library needed to test), chunker no-loss properties, incremental
-indexing, deletion purging, read-only enforcement (including hostile `#`/`%`
-database paths), unicode queries and piped-console output on Windows,
-cross-corpus purge protection, FTS5 query-injection neutralization, the eval
-harness, and the report layer (byte-determinism, HTML escaping of corpus
-content and narrative, chart gap/label semantics, empty-index safety) —
-every finding from the adversarial reviews is pinned by a regression test.
+The suite (109 tests) covers every extractor (including a byte-level
+generated PDF — no PDF library needed to test), chunker no-loss properties,
+incremental indexing, deletion purging, read-only enforcement (including
+hostile `#`/`%` database paths), unicode queries and piped-console output on
+Windows, cross-corpus purge protection, FTS5 query-injection neutralization,
+the eval harness, the report layer (byte-determinism, HTML escaping of
+corpus content and narrative, chart gap/label semantics, empty-index
+safety), the v1→v2 migration (id preservation, idempotence), collection
+scoping and purge isolation, the localhost-only write rule, CSRF and
+DNS-rebinding defenses, upload constraints (traversal, overwrite, size,
+byte-exactness, cleanup on failure), and the feedback→promote loop — every
+finding from the adversarial reviews is pinned by a regression test.
 
 ## License
 

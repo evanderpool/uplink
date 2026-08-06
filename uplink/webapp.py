@@ -1,42 +1,171 @@
-"""Uplink web UI — a local, read-only retrieval explorer.
+"""Uplink web UI — a local retrieval explorer with localhost-gated writes.
 
 `python -m uplink serve` starts a stdlib-only HTTP server (no frameworks, no
-JavaScript dependencies) with three surfaces:
+JavaScript dependencies):
 
-    GET /                     the Ask page (search box + cited results)
-    GET /api/search?q=&k=     search results as JSON (read-only)
-    GET /api/status           index statistics as JSON
-    GET /reports/<kind>.html  generated reports, if present
+    GET  /                     the Ask page (search box + cited results)
+    GET  /api/search?q=&k=&collection=   search results as JSON (read-only)
+    GET  /api/status           index statistics as JSON
+    GET  /reports/<kind>.html  generated reports, if present
+    POST /api/upload           add a document to a collection   (localhost only)
+    POST /api/feedback         thumbs up/down on a result       (localhost only)
 
 Security posture:
 - binds to 127.0.0.1 unless --host says otherwise (Tailscale exposure is a
   deliberate operator choice, never a default);
-- every database connection is read-only (SQLite mode=ro) — there is no
-  write endpoint and no write capability;
+- THE LOCALHOST-ONLY WRITE RULE: the two write endpoints exist only when the
+  server is bound to a loopback address. Bound to anything wider, every POST
+  returns 403 and the UI never renders the controls — a phone on the
+  tailnet is ask-only by construction, not by convention;
+- browser-borne attacks on the loopback server are closed off twice: every
+  request's Host header must name the server itself (defeats DNS
+  rebinding), and write POSTs must carry the custom X-Uplink header and a
+  loopback Origin (defeats CSRF — a hostile web page cannot attach custom
+  headers cross-origin without a CORS preflight this server never grants);
+- search paths still open the database read-only (SQLite mode=ro); the only
+  database writes go through the same indexer the CLI uses;
+- uploads are constrained: extension whitelist, size cap, sanitized bare
+  filename, stored under data/uploads/<collection>/. A collection bound to a
+  real folder refuses uploads rather than writing into the operator's files;
 - corpus text reaches the page as JSON and is rendered with textContent,
-  never innerHTML, so document content cannot inject markup or script.
+  never innerHTML, so document content cannot inject markup or script;
+- the query log and feedback log are local JSONL files next to the database.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
+import socket
 import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import db
+from .extractors import SUPPORTED_EXTENSIONS
+from .feedback import VALID_VOTES, append_jsonl
 from .search import hits_to_dicts, search
 
 MAX_QUERY_LEN = 500
 MAX_K = 25
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_FEEDBACK_BYTES = 10 * 1024
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]")
 
 
-def make_handler(db_path: Path, reports_dir: Path | None):
+def sanitize_filename(raw: str) -> str:
+    """Reduce a client-supplied filename to a safe bare name, or raise.
+
+    Path separators are stripped (basename only), unsafe characters removed,
+    and hidden/empty names rejected. The extension must be one the indexer
+    supports — anything else has no reason to enter the corpus.
+    """
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = _SAFE_FILENAME_RE.sub("", name)
+    if not name or name.startswith(".") or len(name) > 150:
+        raise ValueError("invalid filename")
+    ext = Path(name).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS or len(Path(name).stem.strip()) == 0:
+        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ValueError(f"unsupported file type '{ext or '(none)'}' — allowed: {allowed}")
+    return name
+
+
+def parse_multipart(body: bytes, content_type: str) -> dict[str, tuple[str, bytes]]:
+    """Minimal multipart/form-data parser (stdlib `cgi` is gone in 3.13).
+
+    Returns {field_name: (filename, value_bytes)}; filename is "" for plain
+    fields. Preserves part content byte-exactly: only the single transport
+    CRLF before the next boundary is removed, never the payload's own
+    trailing newlines (a stripped final 0x0A corrupts uploads and makes the
+    stored sha256 hash a file the operator never sent). Raises ValueError on
+    anything that does not look like multipart.
+    """
+    m = re.search(r'boundary="?([^";]+)"?', content_type)
+    if not m:
+        raise ValueError("missing multipart boundary")
+    delim = b"--" + m.group(1).encode("ascii", "replace")
+    fields: dict[str, tuple[str, bytes]] = {}
+    segments = body.split(delim)
+    for seg in segments[1:]:  # segments[0] is the preamble
+        if seg.startswith(b"--"):
+            break  # closing delimiter
+        if seg.startswith(b"\r\n"):
+            seg = seg[2:]
+        head, sep, payload = seg.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]  # the transport CRLF before the delimiter
+        disp = ""
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-disposition"):
+                disp = line.decode("utf-8", "replace")
+        # `name=` must not match inside `filename=` regardless of parameter
+        # order (RFC 7578 fixes neither order nor our luck).
+        name_m = re.search(r'(?<![a-zA-Z])name="([^"]*)"', disp)
+        if not name_m:
+            continue
+        file_m = re.search(r'filename="([^"]*)"', disp)
+        fields[name_m.group(1)] = (file_m.group(1) if file_m else "", payload)
+    if not fields:
+        raise ValueError("empty multipart body")
+    return fields
+
+
+def make_handler(
+    db_path: Path,
+    reports_dir: Path | None,
+    writes_enabled: bool,
+    bind_host: str = "127.0.0.1",
+):
+    data_dir = db_path.parent
+    uploads_root = data_dir / "uploads"
+    query_log = data_dir / "query-log.jsonl"
+    feedback_log = data_dir / "feedback.jsonl"
+    allowed_hosts = {bind_host.lower(), "127.0.0.1", "localhost", "::1", "[::1]"}
+    # Serializes browser uploads: index_folder holds a write transaction for
+    # its whole run, so without this a second simultaneous upload waits out
+    # busy_timeout and dies with "database is locked".
+    write_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "Uplink"
 
+        def _host_ok(self) -> bool:
+            """The Host header must name this server or be an IP literal —
+            defeats DNS rebinding, where evil.com re-points to 127.0.0.1 so a
+            hostile page's fetches become same-origin and corpus text becomes
+            readable off-machine. IP-literal Hosts are safe (rebinding needs
+            a DNS name) and keep deliberate wide binds (0.0.0.0, a Tailscale
+            IP) reachable by address."""
+            host = (self.headers.get("Host") or "").strip().lower()
+            if not host:
+                return True  # HTTP/1.0 clients; browsers always send Host
+            if host.startswith("["):  # [::1]:8180
+                host = host.split("]", 1)[0].lstrip("[")
+            else:
+                host = host.rsplit(":", 1)[0]
+            if host in allowed_hosts or f"[{host}]" in allowed_hosts:
+                return True
+            try:
+                ipaddress.ip_address(host)
+                return True
+            except ValueError:
+                return False
+
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
+            if not self._host_ok():
+                self._json(403, {"error": "unrecognized Host header"})
+                return
             url = urlparse(self.path)
             try:
                 if url.path == "/":
@@ -51,24 +180,71 @@ def make_handler(db_path: Path, reports_dir: Path | None):
                     self._send(404, "text/plain; charset=utf-8", b"not found")
             except FileNotFoundError as exc:
                 self._json(404, {"error": str(exc)})
+            except ValueError as exc:  # bad parameter (e.g. collection name)
+                self._json(400, {"error": str(exc)})
             except Exception as exc:  # never leak a traceback to the client
                 self._json(500, {"error": f"{type(exc).__name__}"})
                 raise
 
         def do_POST(self) -> None:  # noqa: N802
-            # Read-only surface: no mutating methods, by construction.
-            # Drain the request body first or the client sees a reset
-            # instead of the 405 (Windows aborts on unread request data).
-            length = int(self.headers.get("Content-Length") or 0)
-            while length > 0:
-                length -= len(self.rfile.read(min(length, 1 << 16)))
-            self._send(405, "text/plain; charset=utf-8", b"read-only")
+            url = urlparse(self.path)
+            if not writes_enabled:
+                # The localhost-only rule. Drain the body first or Windows
+                # clients see a connection reset instead of the status.
+                self._drain()
+                self._json(403, {"error": "writes are enabled only when bound to localhost"})
+                return
+            if not self._host_ok():
+                self._drain()
+                self._json(403, {"error": "unrecognized Host header"})
+                return
+            # CSRF defense: a browser will not attach a custom header to a
+            # cross-origin request without a CORS preflight, and this server
+            # never grants one — so requiring X-Uplink (plus a loopback
+            # Origin when one is sent) means a hostile page the operator
+            # happens to visit cannot write into the corpus.
+            origin = (self.headers.get("Origin") or "").strip()
+            if origin:
+                o_host = urlparse(origin).hostname or ""
+                if o_host not in ("127.0.0.1", "localhost", "::1"):
+                    self._drain()
+                    self._json(403, {"error": "cross-origin writes are not allowed"})
+                    return
+            if not self.headers.get("X-Uplink"):
+                self._drain()
+                self._json(403, {"error": "missing X-Uplink header"})
+                return
+            try:
+                if url.path == "/api/upload":
+                    self._api_upload()
+                elif url.path == "/api/feedback":
+                    self._api_feedback()
+                else:
+                    self._drain()
+                    self._send(404, "text/plain; charset=utf-8", b"not found")
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+            except sqlite3.OperationalError:
+                # Another writer (a CLI index run) holds the database lock.
+                self._json(503, {"error": "index is busy — try again shortly"})
+            except Exception as exc:
+                self._json(500, {"error": f"{type(exc).__name__}"})
+                raise
 
-        do_PUT = do_DELETE = do_PATCH = do_POST
+        def do_PUT(self) -> None:  # noqa: N802
+            self._drain()
+            self._send(405, "text/plain; charset=utf-8", b"method not allowed")
+
+        do_DELETE = do_PATCH = do_PUT
+
+        # ------------------------------------------------------------- reads
 
         def _api_search(self, url) -> None:
             params = parse_qs(url.query)
             query = (params.get("q") or [""])[0].strip()[:MAX_QUERY_LEN]
+            collection = (params.get("collection") or [""])[0].strip() or None
+            if collection is not None:
+                collection = db.validate_collection(collection)
             try:
                 k = min(MAX_K, max(1, int((params.get("k") or ["8"])[0])))
             except ValueError:
@@ -76,8 +252,30 @@ def make_handler(db_path: Path, reports_dir: Path | None):
             if not query:
                 self._json(400, {"error": "missing q parameter"})
                 return
-            hits = search(db_path, query, k=k)
-            self._json(200, {"query": query, "k": k, "hits": hits_to_dicts(hits)})
+            t0 = time.perf_counter()
+            hits = search(db_path, query, k=k, collection=collection)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            append_jsonl(
+                query_log,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "q": query,
+                    "collection": collection,
+                    "k": k,
+                    "hits": len(hits),
+                    "latency_ms": latency_ms,
+                },
+            )
+            self._json(
+                200,
+                {
+                    "query": query,
+                    "k": k,
+                    "collection": collection,
+                    "latency_ms": latency_ms,
+                    "hits": hits_to_dicts(hits),
+                },
+            )
 
         def _api_status(self) -> None:
             conn = db.connect_ro(db_path)
@@ -87,9 +285,7 @@ def make_handler(db_path: Path, reports_dir: Path | None):
                 latest = conn.execute(
                     "SELECT MAX(indexed_at) t FROM documents"
                 ).fetchone()["t"]
-                root = conn.execute(
-                    "SELECT value FROM meta WHERE key='corpus_root'"
-                ).fetchone()
+                collections = db.list_collections(conn)
             finally:
                 conn.close()
             self._json(
@@ -98,7 +294,8 @@ def make_handler(db_path: Path, reports_dir: Path | None):
                     "documents": docs,
                     "chunks": chunks,
                     "last_indexed": latest,
-                    "corpus_root": root["value"] if root else None,
+                    "collections": collections,
+                    "writes": writes_enabled,
                     "reports": _available_reports(reports_dir),
                 },
             )
@@ -116,6 +313,171 @@ def make_handler(db_path: Path, reports_dir: Path | None):
                 self._send(404, "text/plain; charset=utf-8", b"report not generated yet")
                 return
             self._send(200, "text/html; charset=utf-8", page.read_bytes())
+
+        # ------------------------------------------------------ writes (localhost)
+
+        def _read_body(self, cap: int) -> bytes:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                raise ValueError("invalid Content-Length") from None
+            if length < 0:
+                # A negative length must not reach rfile.read(): read(-1)
+                # reads the socket to EOF, bypassing the cap entirely.
+                raise ValueError("invalid Content-Length")
+            if length > cap:
+                # Discard so the client receives the error instead of a reset.
+                self._drain()
+                raise ValueError(f"body too large (max {cap} bytes)")
+            return self.rfile.read(length) if length else b""
+
+        def _api_upload(self) -> None:
+            ctype = self.headers.get("Content-Type") or ""
+            if "multipart/form-data" not in ctype:
+                self._drain()
+                raise ValueError("expected multipart/form-data")
+            body = self._read_body(MAX_UPLOAD_BYTES)
+            fields = parse_multipart(body, ctype)
+            filename_raw, file_bytes = fields.get("file", ("", b""))
+            if not filename_raw or not file_bytes:
+                raise ValueError("missing file field")
+            _, coll_bytes = fields.get("collection", ("", b""))
+            collection = db.validate_collection(
+                coll_bytes.decode("utf-8", "replace").strip() or db.DEFAULT_COLLECTION
+            )
+            filename = sanitize_filename(filename_raw)
+
+            target_dir = (uploads_root / collection).resolve()
+            # A collection bound to a real folder must not be written to.
+            conn = db.connect_ro(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key=?", (f"corpus_root:{collection}",)
+                ).fetchone()
+            finally:
+                conn.close()
+            if row and Path(row["value"]) != target_dir:
+                self._json(
+                    409,
+                    {
+                        "error": (
+                            f"collection '{collection}' is bound to folder "
+                            f"'{row['value']}' — drop the file there and re-index, "
+                            "or upload to a different collection"
+                        )
+                    },
+                )
+                return
+
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / filename
+            with write_lock:
+                self._save_and_index(target, file_bytes, target_dir, collection, filename)
+
+        def _save_and_index(
+            self, target: Path, file_bytes: bytes, target_dir: Path,
+            collection: str, filename: str,
+        ) -> None:
+            if target.exists() and target.read_bytes() != file_bytes:
+                # Sanitization strips directories, so distinct sources can
+                # collide on one name — refuse rather than silently replace
+                # an already-indexed document.
+                self._json(
+                    409,
+                    {
+                        "error": (
+                            f"'{filename}' already exists in '{collection}' with "
+                            "different content — rename the file or remove the "
+                            "existing one first"
+                        )
+                    },
+                )
+                return
+            target.write_bytes(file_bytes)
+
+            from .indexer import index_folder
+
+            try:
+                stats = index_folder(target_dir, db_path, collection=collection)
+            except Exception:
+                # Never leave an unindexed file behind: it would silently
+                # join the corpus on the next unrelated index run.
+                target.unlink(missing_ok=True)
+                raise
+            own_errors = [e for e in stats.errors if e.startswith(filename + ":")]
+            if own_errors:
+                target.unlink(missing_ok=True)
+                self._json(400, {"error": f"file could not be indexed: {own_errors[0]}"})
+                return
+            self._json(
+                200,
+                {
+                    "saved": filename,
+                    "collection": collection,
+                    "indexed": stats.indexed,
+                    "unchanged": stats.unchanged,
+                    "chunks": stats.chunks,
+                    "errors": stats.errors,
+                },
+            )
+
+        def _api_feedback(self) -> None:
+            body = self._read_body(MAX_FEEDBACK_BYTES)
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("expected a JSON body") from None
+            if not isinstance(payload, dict):
+                raise ValueError("expected a JSON object")
+            q = str(payload.get("q") or "").strip()[:MAX_QUERY_LEN]
+            path = str(payload.get("path") or "").strip()[:500]
+            vote = payload.get("vote")
+            if not q or not path or vote not in VALID_VOTES:
+                raise ValueError("feedback needs q, path, and vote of 'up' or 'down'")
+            collection = payload.get("collection")
+            if collection:
+                collection = db.validate_collection(str(collection))
+            # The path must name an indexed document. Unvalidated, a forged
+            # short path (e.g. "e") promoted into a fixture matches nearly
+            # every result by substring and inflates the quality numbers.
+            conn = db.connect_ro(db_path)
+            try:
+                if collection:
+                    known = conn.execute(
+                        "SELECT 1 FROM documents WHERE collection = ? AND path = ?",
+                        (collection, path),
+                    ).fetchone()
+                else:
+                    known = conn.execute(
+                        "SELECT 1 FROM documents WHERE path = ?", (path,)
+                    ).fetchone()
+            finally:
+                conn.close()
+            if not known:
+                raise ValueError("path does not name an indexed document")
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "q": q,
+                "path": path,
+                "seq": payload.get("seq") if isinstance(payload.get("seq"), int) else None,
+                "vote": vote,
+                "collection": collection or None,
+            }
+            append_jsonl(feedback_log, entry)
+            self._json(200, {"recorded": vote})
+
+        # ---------------------------------------------------------- plumbing
+
+        def _drain(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return
+            while length > 0:
+                read = self.rfile.read(min(length, 1 << 16))
+                if not read:
+                    break
+                length -= len(read)
 
         def _json(self, code: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=True).encode("ascii")
@@ -148,12 +510,26 @@ def _available_reports(reports_dir: Path | None) -> list[str]:
 
 def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | None) -> None:
     db_file = Path(db_path)
+    writes_enabled = host in LOOPBACK_HOSTS
+    if writes_enabled and not db_file.exists():
+        # First-run flow: serve an empty index so the operator can upload
+        # their first document through the browser.
+        db.connect_rw(db_file).close()
     # Fail fast with the standard message if the index does not exist.
     probe: sqlite3.Connection = db.connect_ro(db_file)
     probe.close()
-    handler = make_handler(db_file, Path(reports_dir) if reports_dir else None)
-    httpd = ThreadingHTTPServer((host, port), handler)
-    print(f"Uplink serving http://{host}:{port}  (db: {db_file}, read-only)")
+    handler = make_handler(
+        db_file, Path(reports_dir) if reports_dir else None, writes_enabled, host
+    )
+
+    class _Server(ThreadingHTTPServer):
+        # ThreadingHTTPServer is AF_INET-only by default; an IPv6 bind
+        # (::1, or a Tailscale IPv6 address) needs the right family.
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+    httpd = _Server((host, port), handler)
+    mode = "writes: localhost-enabled" if writes_enabled else "read-only (non-loopback bind)"
+    print(f"Uplink serving http://{host}:{port}  (db: {db_file}, {mode})")
     print("Ctrl+C to stop.")
     try:
         httpd.serve_forever()
@@ -166,6 +542,8 @@ def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | N
 # ---------------------------------------------------------------------------
 # The page. One file, inline CSS/JS, same design tokens as the reports.
 # Corpus-derived strings are ALWAYS rendered via textContent.
+# Write controls (upload, thumbs) render only when /api/status says writes
+# are enabled — and the server refuses the POSTs regardless of the UI.
 # ---------------------------------------------------------------------------
 
 PAGE = """<!doctype html>
@@ -181,13 +559,13 @@ body {
   background: var(--page); color: var(--ink);
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
   --muted: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
-  --accent: #2a78d6; --accent-ink: #ffffff;
+  --accent: #2a78d6; --accent-ink: #ffffff; --good: #2e7d4f; --bad: #b3402a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) body {
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
     --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
-    --accent: #3987e5; --accent-ink: #ffffff;
+    --accent: #3987e5; --accent-ink: #ffffff; --good: #58b384; --bad: #e0765f;
   }
 }
 main { max-width: 720px; margin: 0 auto; }
@@ -198,13 +576,18 @@ nav { margin-left: auto; display: flex; gap: 14px; }
 nav a { color: var(--ink-2); font-size: 12.5px; text-decoration: none; border-bottom: 1px solid var(--grid); padding-bottom: 1px; }
 nav a:hover { color: var(--ink); border-color: var(--ink-2); }
 #statusline { color: var(--muted); font-size: 12px; margin: 2px 0 22px; min-height: 15px; }
-form { display: flex; gap: 8px; }
+form#f { display: flex; gap: 8px; }
 #q {
   flex: 1; font: inherit; font-size: 15px; color: var(--ink);
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 12px 14px; outline: none;
+  border-radius: 10px; padding: 12px 14px; outline: none; min-width: 0;
 }
 #q:focus { border-color: var(--accent); }
+select {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 0 10px; max-width: 160px;
+}
 button {
   font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
   background: var(--accent); color: var(--accent-ink);
@@ -218,15 +601,33 @@ button:disabled { opacity: 0.6; cursor: default; }
 }
 .cite { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .path { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.coll { color: var(--accent); font-size: 11px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 .section { color: var(--ink-2); font-size: 12.5px; }
 .score { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .snippet { color: var(--ink-2); font-size: 13px; line-height: 1.5; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fb { display: flex; gap: 6px; margin-top: 8px; }
+.fb button {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 8px; font-size: 12px; padding: 3px 10px; font-weight: 500;
+}
+.fb button:hover { color: var(--ink); border-color: var(--ink-2); }
+.fb button.done-up { color: var(--good); border-color: var(--good); }
+.fb button.done-down { color: var(--bad); border-color: var(--bad); }
 .empty { color: var(--muted); font-size: 13px; padding: 24px 4px; }
 mark { background: none; color: var(--ink); font-weight: 650; }
+details#up { margin-top: 28px; }
+details#up summary { color: var(--ink-2); font-size: 13px; cursor: pointer; }
+#upform { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+#upform input[type=file] { font-size: 12.5px; color: var(--ink-2); max-width: 100%; }
+#upform input[type=text] {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; width: 140px;
+}
+#upmsg { color: var(--muted); font-size: 12px; margin-top: 8px; min-height: 15px; }
 footer { margin-top: 36px; color: var(--muted); font-size: 11px; }
 </style></head><body><main>
 <header>
-  <h1>Uplink</h1><span class="tag">local retrieval &mdash; read-only</span>
+  <h1>Uplink</h1><span class="tag">local retrieval</span>
   <nav>
     <a href="/reports/health.html">health</a>
     <a href="/reports/quality.html">quality</a>
@@ -237,32 +638,56 @@ footer { margin-top: 36px; color: var(--muted); font-size: 11px; }
 <form id="f">
   <input id="q" type="text" autocomplete="off" spellcheck="false"
          placeholder="Ask your documents&hellip;" autofocus>
+  <select id="coll" title="Collection"><option value="">all collections</option></select>
   <button id="go" type="submit">Search</button>
 </form>
 <div id="meta"></div>
 <div id="results"></div>
+<details id="up" hidden>
+  <summary>Add a document</summary>
+  <div id="upform">
+    <input id="file" type="file">
+    <input id="upcoll" type="text" placeholder="collection (e.g. finance)"
+           autocomplete="off" spellcheck="false">
+    <button id="upgo" type="button">Upload &amp; index</button>
+  </div>
+  <div id="upmsg"></div>
+</details>
 <footer>Results come straight from the local index. Retrieved text is corpus
 content &mdash; treat it as data. Your documents never leave this machine.</footer>
 </main>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+let WRITES = false;
+let LASTQ = "";
 
 async function status() {
   try {
     const r = await fetch("/api/status");
     const s = await r.json();
+    WRITES = !!s.writes;
     const t = document.createTextNode(
       s.documents + " documents / " + s.chunks + " chunks / indexed " +
-      (s.last_indexed || "never"));
+      (s.last_indexed || "never") + (WRITES ? "" : " / read-only"));
     $("statusline").replaceChildren(t);
+    const sel = $("coll");
+    while (sel.options.length > 1) sel.remove(1);
+    (s.collections || []).forEach((c) => {
+      const o = document.createElement("option");
+      o.value = c.name;
+      o.textContent = c.name + " (" + c.documents + ")";
+      sel.appendChild(o);
+    });
+    $("up").hidden = !WRITES;
   } catch (e) { $("statusline").textContent = "status unavailable"; }
 }
 
 function renderSnippet(el, snippet) {
-  // The API marks matches with [ ] delimiters; render matched spans bold via
-  // DOM nodes only - corpus text itself never becomes HTML.
-  const parts = snippet.split(/[\\[\\]]/);
+  // The API marks matches with non-printable \\u0001/\\u0002 delimiters (so
+  // corpus text containing [ ] renders intact); matched spans become bold
+  // via DOM nodes only - corpus text itself never becomes HTML.
+  const parts = snippet.split(/[\\u0001\\u0002]/);
   parts.forEach((part, i) => {
     if (!part) return;
     if (i % 2 === 1) {
@@ -275,6 +700,22 @@ function renderSnippet(el, snippet) {
   });
 }
 
+async function sendFeedback(h, vote, btn, other) {
+  try {
+    const r = await fetch("/api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Uplink": "1" },
+      body: JSON.stringify({
+        q: LASTQ, path: h.path, seq: h.seq, vote: vote, collection: h.collection,
+      }),
+    });
+    if (r.ok) {
+      btn.className = "done-" + vote;
+      other.className = "";
+    }
+  } catch (e) { /* feedback is best-effort */ }
+}
+
 function renderHit(h) {
   const card = document.createElement("div");
   card.className = "hit";
@@ -284,6 +725,12 @@ function renderHit(h) {
   path.className = "path";
   path.textContent = h.path;
   cite.appendChild(path);
+  if (h.collection) {
+    const c = document.createElement("span");
+    c.className = "coll";
+    c.textContent = h.collection;
+    cite.appendChild(c);
+  }
   if (h.section) {
     const sec = document.createElement("span");
     sec.className = "section";
@@ -299,6 +746,19 @@ function renderHit(h) {
   snip.className = "snippet";
   renderSnippet(snip, h.snippet);
   card.appendChild(snip);
+  if (WRITES) {
+    const fb = document.createElement("div");
+    fb.className = "fb";
+    const upB = document.createElement("button");
+    upB.textContent = "\\uD83D\\uDC4D helpful";
+    const downB = document.createElement("button");
+    downB.textContent = "\\uD83D\\uDC4E off-target";
+    upB.addEventListener("click", () => sendFeedback(h, "up", upB, downB));
+    downB.addEventListener("click", () => sendFeedback(h, "down", downB, upB));
+    fb.appendChild(upB);
+    fb.appendChild(downB);
+    card.appendChild(fb);
+  }
   return card;
 }
 
@@ -306,29 +766,62 @@ $("f").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const q = $("q").value.trim();
   if (!q) return;
+  LASTQ = q;
   $("go").disabled = true;
   $("meta").textContent = "searching\\u2026";
   try {
-    const r = await fetch("/api/search?q=" + encodeURIComponent(q) + "&k=8");
+    let url = "/api/search?q=" + encodeURIComponent(q) + "&k=8";
+    const coll = $("coll").value;
+    if (coll) url += "&collection=" + encodeURIComponent(coll);
+    const r = await fetch(url);
     const data = await r.json();
     const results = $("results");
     results.replaceChildren();
     if (data.error) {
       $("meta").textContent = "error: " + data.error;
     } else if (!data.hits.length) {
-      $("meta").textContent = "no results";
+      $("meta").textContent = "no results (" + data.latency_ms + " ms)";
       const d = document.createElement("div");
       d.className = "empty";
       d.textContent = "Nothing matched. Try fewer or different words.";
       results.appendChild(d);
     } else {
-      $("meta").textContent = data.hits.length + " results for \\u201C" + q + "\\u201D";
+      $("meta").textContent = data.hits.length + " results for \\u201C" + q +
+        "\\u201D \\u00B7 " + data.latency_ms + " ms";
       data.hits.forEach((h) => results.appendChild(renderHit(h)));
     }
   } catch (e) {
     $("meta").textContent = "search failed - is the server still running?";
   } finally {
     $("go").disabled = false;
+  }
+});
+
+$("upgo").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { $("upmsg").textContent = "choose a file first"; return; }
+  const fd = new FormData();
+  fd.append("collection", $("upcoll").value.trim() || "main");
+  fd.append("file", f);
+  $("upgo").disabled = true;
+  $("upmsg").textContent = "uploading\\u2026";
+  try {
+    const r = await fetch("/api/upload", {
+      method: "POST", headers: { "X-Uplink": "1" }, body: fd,
+    });
+    const data = await r.json();
+    if (data.error) {
+      $("upmsg").textContent = "error: " + data.error;
+    } else {
+      $("upmsg").textContent = "indexed " + data.saved + " into '" +
+        data.collection + "' (" + data.chunks + " chunks)";
+      $("file").value = "";
+      status();
+    }
+  } catch (e) {
+    $("upmsg").textContent = "upload failed";
+  } finally {
+    $("upgo").disabled = false;
   }
 });
 

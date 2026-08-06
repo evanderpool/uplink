@@ -13,3 +13,6 @@ data/
 # Generated reports contain corpus content - the capability is public,
 # your outputs are not.
 reports/
+
+# Fetched test corpora - re-download with scripts/fetch_corpora.py.
+corpora/

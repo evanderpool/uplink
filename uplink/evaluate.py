@@ -81,11 +81,16 @@ def _matches(hit, expects: list[str]) -> bool:
     return any(e.lower() in path for e in expects)
 
 
-def run_eval(db_path: str | Path, fixtures_path: str | Path, k: int = 5) -> EvalResult:
+def run_eval(
+    db_path: str | Path,
+    fixtures_path: str | Path,
+    k: int = 5,
+    collection: str | None = None,
+) -> EvalResult:
     result = EvalResult(k=k)
     for fx in load_fixtures(fixtures_path):
         result.total += 1
-        hits = search(db_path, fx["q"], k=k)
+        hits = search(db_path, fx["q"], k=k, collection=collection)
         rank = next(
             (i for i, h in enumerate(hits, start=1) if _matches(h, fx["expect"])), 0
         )

@@ -2,9 +2,9 @@
 
 Incremental: a file with unchanged mtime+size is skipped without hashing;
 if either differs, the SHA-256 decides whether re-chunking is needed. Deleted
-files are purged. One database belongs to one corpus root — indexing a
-different root into the same database is refused rather than silently
-purging the previous corpus.
+files are purged. Each collection belongs to one corpus root — indexing a
+different root into an existing collection is refused rather than silently
+purging its documents.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ IGNORED_DIRS = {
 
 
 class CorpusMismatch(ValueError):
-    """The database already belongs to a different corpus root."""
+    """The collection already belongs to a different corpus root."""
 
 
 @dataclass
@@ -76,21 +76,26 @@ def _iter_files(root: Path, skip: set[Path]) -> list[Path]:
     return files
 
 
-def _check_corpus_root(conn: sqlite3.Connection, root: Path) -> None:
-    row = conn.execute("SELECT value FROM meta WHERE key='corpus_root'").fetchone()
+def _check_corpus_root(conn: sqlite3.Connection, root: Path, collection: str) -> None:
+    key = f"corpus_root:{collection}"
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     if row and row["value"] != str(root):
         raise CorpusMismatch(
-            f"This database indexes '{row['value']}'. Refusing to index "
-            f"'{root}' into it (that would purge the existing corpus). "
-            f"Use a separate --db file per corpus."
+            f"Collection '{collection}' indexes '{row['value']}'. Refusing to "
+            f"index '{root}' into it (that would purge the existing documents). "
+            f"Use a different --collection, or a separate --db file."
         )
     conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('corpus_root', ?)",
-        (str(root),),
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, str(root))
     )
 
 
-def index_folder(corpus_dir: str | Path, db_path: str | Path) -> IndexStats:
+def index_folder(
+    corpus_dir: str | Path,
+    db_path: str | Path,
+    collection: str = db.DEFAULT_COLLECTION,
+) -> IndexStats:
+    collection = db.validate_collection(collection)
     root = Path(corpus_dir).resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Corpus folder not found: {root}")
@@ -103,21 +108,23 @@ def index_folder(corpus_dir: str | Path, db_path: str | Path) -> IndexStats:
     stats = IndexStats()
     conn = db.connect_rw(db_path)
     try:
-        _check_corpus_root(conn, root)
+        _check_corpus_root(conn, root, collection)
         seen_paths: set[str] = set()
         for path in _iter_files(root, skip):
             rel = path.relative_to(root).as_posix()
             seen_paths.add(rel)
             stats.scanned += 1
             try:
-                _index_file(conn, rel, path, stats)
+                _index_file(conn, collection, rel, path, stats)
             except ExtractorUnavailable as exc:
                 stats.errors.append(f"{rel}: {exc}")
             except Exception as exc:  # one bad file must not sink the run
                 stats.errors.append(f"{rel}: {type(exc).__name__}: {exc}")
 
-        # Purge documents whose source files no longer exist.
-        for row in conn.execute("SELECT id, path FROM documents").fetchall():
+        # Purge documents (in this collection only) whose files no longer exist.
+        for row in conn.execute(
+            "SELECT id, path FROM documents WHERE collection = ?", (collection,)
+        ).fetchall():
             if row["path"] not in seen_paths:
                 conn.execute("DELETE FROM chunks WHERE doc_id = ?", (row["id"],))
                 conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
@@ -132,11 +139,13 @@ def index_folder(corpus_dir: str | Path, db_path: str | Path) -> IndexStats:
 
 
 def _index_file(
-    conn: sqlite3.Connection, rel: str, path: Path, stats: IndexStats
+    conn: sqlite3.Connection, collection: str, rel: str, path: Path, stats: IndexStats
 ) -> None:
     stat = path.stat()
     existing = conn.execute(
-        "SELECT id, sha256, mtime, size FROM documents WHERE path = ?", (rel,)
+        "SELECT id, sha256, mtime, size FROM documents "
+        "WHERE collection = ? AND path = ?",
+        (collection, rel),
     ).fetchone()
 
     # Fast path: identical mtime+size means unchanged — skip hashing entirely.
@@ -163,9 +172,11 @@ def _index_file(
         conn.execute("DELETE FROM documents WHERE id = ?", (existing["id"],))
 
     cur = conn.execute(
-        "INSERT INTO documents(path, filetype, sha256, mtime, size, title, indexed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO documents"
+        "(collection, path, filetype, sha256, mtime, size, title, indexed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            collection,
             rel,
             path.suffix.lower().lstrip("."),
             sha,

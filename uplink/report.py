@@ -79,9 +79,13 @@ def health_data(db_path: Path) -> dict:
         last_indexed = conn.execute(
             "SELECT MAX(indexed_at) t FROM documents"
         ).fetchone()["t"]
-        corpus_root = conn.execute(
-            "SELECT value FROM meta WHERE key='corpus_root'"
-        ).fetchone()
+        collections = db.list_collections(conn)
+        roots = {
+            r["key"].removeprefix("corpus_root:"): r["value"]
+            for r in conn.execute(
+                "SELECT key, value FROM meta WHERE key LIKE 'corpus_root:%'"
+            )
+        }
     finally:
         conn.close()
     return {
@@ -91,13 +95,21 @@ def health_data(db_path: Path) -> dict:
         "by_type": by_type,
         "largest": largest,
         "last_indexed": last_indexed,
-        "corpus_root": corpus_root["value"] if corpus_root else None,
+        "collections": collections,
+        "roots": roots,
     }
 
 
 def quality_data(db_path: Path, fixtures: Path, history: Path | None, k: int = 5) -> dict:
     result = run_eval(db_path, fixtures, k=k)
     history_rows = load_history(history) if history and history.exists() else []
+    # A "quality over time" line is only honest within one fixture set:
+    # mixing runs of different fixtures (or corpora) would chart an
+    # improvement that was never measured.
+    history_rows = [
+        r for r in history_rows
+        if r.get("fixtures") == fixtures.name and r.get("db") == db_path.name
+    ]
     return {
         "summary": result.to_dict(),
         "per_question": result.per_question,
@@ -132,11 +144,24 @@ def activity_data(db_path: Path, now: datetime) -> dict:
 # Eval history log
 # --------------------------------------------------------------------------
 
-def append_history(history: Path, summary: dict, now: datetime, label: str = "") -> None:
-    """Append one eval run to the history log (metrics only, no corpus text)."""
+def append_history(
+    history: Path,
+    summary: dict,
+    now: datetime,
+    label: str = "",
+    db: str | Path = "",
+    fixtures: str | Path = "",
+) -> None:
+    """Append one eval run to the history log (metrics only, no corpus text).
+
+    `db` and `fixtures` record run provenance (basenames only) so the quality
+    chart can refuse to plot runs of different corpora/fixture sets as one line.
+    """
     entry = {
         "ts": now.isoformat(timespec="seconds"),
         "label": label,
+        "db": Path(db).name if db else "",
+        "fixtures": Path(fixtures).name if fixtures else "",
         "questions": summary["questions"],
         "hit_at_1": summary["hit_at_1"],
         "hit_at_k": summary["hit_at_k"],
@@ -152,8 +177,14 @@ def load_history(history: Path) -> list[dict]:
     rows = []
     for line in history.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
+        if not line or line.startswith("#"):
+            continue
+        try:
             rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A torn write (crash mid-append) must not sink every future
+            # quality report — same policy as the feedback log reader.
+            continue
     return rows
 
 
@@ -248,13 +279,28 @@ def _render_health(ctx: ReportContext, data: dict) -> str:
         + _narrative_block(ctx, "health")
         + f'<section class="chart">{chart_types}</section>'
         + f'<section class="chart">{chart_chunky}</section>'
+        + "<h2>By collection</h2>"
+        + _table(
+            ["collection", "documents", "chunks", "source"],
+            [
+                [c["name"], c["documents"], c["chunks"], data["roots"].get(c["name"], "")]
+                for c in data["collections"]
+            ],
+        )
         + "<h2>By file type</h2>"
         + _table(
             ["type", "documents", "chunks"],
             [[f".{r['filetype']}", r["docs"], r["chunks"]] for r in data["by_type"]],
         )
     )
-    return _page(ctx, "Corpus Health", data.get("corpus_root"), body)
+    colls = data["collections"]
+    if len(colls) == 1:
+        subtitle = data["roots"].get(colls[0]["name"])
+    elif colls:
+        subtitle = f"{len(colls)} collections: " + ", ".join(c["name"] for c in colls)
+    else:
+        subtitle = None
+    return _page(ctx, "Corpus Health", subtitle, body)
 
 
 def _render_quality(ctx: ReportContext, data: dict) -> str:
