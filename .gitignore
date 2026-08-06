@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local indexes are never committed - they may contain private corpus content.
+data/
+*.db
+*.db-wal
+*.db-shm
