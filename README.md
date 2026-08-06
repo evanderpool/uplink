@@ -53,6 +53,12 @@ AI operating system.
   neutralized), AND with OR fallback.
 - `uplink/evaluate.py` — golden-question harness. Retrieval changes must
   show before/after numbers here before they count as improvements.
+- `uplink/report.py` — deterministic HTML reports (corpus health, retrieval
+  quality, activity) computed straight from the index; an LLM narrative is
+  injected into a marked, escaped block. The script computes, the model
+  narrates.
+- `uplink/svgchart.py` — dependency-free SVG charts (theme-aware via CSS
+  custom properties; light and dark).
 
 ## Install
 
@@ -74,6 +80,8 @@ python -m uplink index  "C:\path\to\your\docs"          # build/refresh index
 python -m uplink search "when do backups run" --k 5     # human output
 python -m uplink search "when do backups run" --json    # for LLM consumption
 python -m uplink eval   fixtures/golden.jsonl           # measure retrieval
+python -m uplink eval   fixtures/golden.jsonl --log --label "baseline"
+python -m uplink report all --fixtures fixtures/golden.jsonl --out reports
 python -m uplink status                                  # index statistics
 ```
 
@@ -97,13 +105,22 @@ The two remaining misses are vocabulary-mismatch questions (the question's
 words don't appear in the answering document) — the documented motivation for
 phase 2.
 
+## Reports
+
+`python -m uplink report all` renders three self-contained HTML reports —
+**Corpus Health**, **Retrieval Quality** (live eval + a quality-over-time
+chart fed by `eval --log` history), and **Corpus Activity** — with inline SVG
+charts, no JavaScript, and light/dark theming. Every figure is computed from
+the index; an optional narrative paragraph (written by an operator or LLM via
+`--narrative-file`) is injected escaped into a clearly-marked block. Reports
+land in `reports/`, which is gitignored: generated reports contain corpus
+content, so the capability is public but your outputs are not.
+
 ## Roadmap
 
 - **Phase 2 — hybrid retrieval:** local embeddings (fastembed +
   `bge-small-en-v1.5`, CPU-only) + reciprocal rank fusion with BM25, gated on
   before/after eval numbers. EmbeddingGemma noted as the upgrade path.
-- **Report templates:** deterministic report + chart generation from index
-  data (the script computes, the model narrates).
 - **Phone access:** question queue via the parent system's signed-request
   bridge pattern (read-only; answers only, no actions).
 
@@ -123,13 +140,14 @@ phase 2.
 python -m pytest tests -q
 ```
 
-41 tests cover every extractor (including a byte-level generated PDF — no
+The suite covers every extractor (including a byte-level generated PDF — no
 PDF library needed to test), chunker no-loss properties, incremental
 indexing, deletion purging, read-only enforcement (including hostile `#`/`%`
 database paths), unicode queries and piped-console output on Windows,
-cross-corpus purge protection, FTS5 query-injection neutralization, and the
-eval harness itself — every finding from the pre-publication adversarial
-review is pinned by a regression test.
+cross-corpus purge protection, FTS5 query-injection neutralization, the eval
+harness, and the report layer (byte-determinism, HTML escaping of corpus
+content and narrative, chart gap/label semantics, empty-index safety) —
+every finding from the adversarial reviews is pinned by a regression test.
 
 ## License
 

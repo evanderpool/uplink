@@ -1,0 +1,1 @@
+{"ts": "2026-08-06T21:05:05+00:00", "label": "v0.1.0 BM25 + stopword filter", "questions": 18, "hit_at_1": 12, "hit_at_k": 16, "k": 5, "mrr": 0.769}

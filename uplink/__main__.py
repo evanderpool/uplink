@@ -2,7 +2,8 @@
 
     python -m uplink index  <corpus_dir> [--db PATH]
     python -m uplink search "question"   [--db PATH] [--k N] [--json]
-    python -m uplink eval   <fixtures>   [--db PATH] [--k N] [--json]
+    python -m uplink eval   <fixtures>   [--db PATH] [--k N] [--json] [--log]
+    python -m uplink report <kind|all>   [--db PATH] [--out DIR] [--fixtures F]
     python -m uplink status              [--db PATH]
 
 `search` and `eval` open the database read-only. Stdout is reconfigured to
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = Path("data") / "index.db"
@@ -45,6 +47,31 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--db", default=str(DEFAULT_DB))
     p_eval.add_argument("--k", type=int, default=5)
     p_eval.add_argument("--json", action="store_true", dest="as_json")
+    p_eval.add_argument(
+        "--log", action="store_true",
+        help="Append this run to the eval history (fixtures/eval-history.jsonl).",
+    )
+    p_eval.add_argument("--label", default="", help="Label for the logged run.")
+    p_eval.add_argument(
+        "--history", default=str(Path("fixtures") / "eval-history.jsonl")
+    )
+
+    p_report = sub.add_parser("report", help="Generate HTML reports (read-only).")
+    p_report.add_argument("kind", choices=["health", "quality", "activity", "all"])
+    p_report.add_argument("--db", default=str(DEFAULT_DB))
+    p_report.add_argument("--out", default="reports")
+    p_report.add_argument("--fixtures", default=None, help="Golden fixtures (enables the quality report).")
+    p_report.add_argument(
+        "--history", default=str(Path("fixtures") / "eval-history.jsonl")
+    )
+    p_report.add_argument(
+        "--narrative-file", default=None,
+        help='JSON file mapping report kind to narrative text, e.g. {"health": "..."}',
+    )
+    p_report.add_argument(
+        "--now", default=None,
+        help="ISO-8601 UTC timestamp override (for reproducible output).",
+    )
 
     p_status = sub.add_parser("status", help="Show index statistics (read-only).")
     p_status.add_argument("--db", default=str(DEFAULT_DB))
@@ -58,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_search(args)
         if args.cmd == "eval":
             return _cmd_eval(args)
+        if args.cmd == "report":
+            return _cmd_report(args)
         if args.cmd == "status":
             return _cmd_status(args)
     except (OSError, ValueError) as exc:
@@ -101,6 +130,61 @@ def _cmd_eval(args) -> int:
         print(json.dumps(result.to_dict(), ensure_ascii=True, indent=2))
     else:
         print(result.summary())
+    if args.log:
+        from .report import append_history
+
+        append_history(
+            Path(args.history),
+            result.to_dict(),
+            datetime.now(timezone.utc),
+            label=args.label,
+        )
+        print(f"logged to {args.history}")
+    return 0
+
+
+def _cmd_report(args) -> int:
+    from .report import REPORT_KINDS, ReportContext, render_all
+
+    kinds = list(REPORT_KINDS) if args.kind == "all" else [args.kind]
+    if args.fixtures is None and "quality" in kinds:
+        if args.kind == "quality":
+            print("error: the quality report needs --fixtures", file=sys.stderr)
+            return 2
+        kinds.remove("quality")
+        print("note: skipping quality report (no --fixtures given)")
+
+    if args.now:
+        now = datetime.fromisoformat(args.now)
+        # A naive timestamp is taken as UTC (not local time) so that
+        # --now produces identical bytes on every machine.
+        now = (
+            now.replace(tzinfo=timezone.utc)
+            if now.tzinfo is None
+            else now.astimezone(timezone.utc)
+        )
+    else:
+        now = datetime.now(timezone.utc)
+    narrative = None
+    if args.narrative_file:
+        narrative = json.loads(Path(args.narrative_file).read_text(encoding="utf-8"))
+        if not isinstance(narrative, dict) or not all(
+            isinstance(v, str) for v in narrative.values()
+        ):
+            raise ValueError(
+                "--narrative-file must be a JSON object mapping report kind to text"
+            )
+
+    ctx = ReportContext(
+        db_path=Path(args.db),
+        out_dir=Path(args.out),
+        now=now,
+        fixtures=Path(args.fixtures) if args.fixtures else None,
+        history=Path(args.history) if args.history else None,
+        narrative=narrative,
+    )
+    for path in render_all(ctx, kinds):
+        print(f"wrote {path}")
     return 0
 
 

@@ -65,7 +65,7 @@ def test_cli_search_survives_unicode_on_piped_stdout(tmp_path: Path):
     index_folder(corpus, db_path)
     proc = subprocess.run(
         [sys.executable, "-m", "uplink", "search", "pipeline ingest", "--db", str(db_path)],
-        capture_output=True,
+        capture_output=True, timeout=60,
         cwd=str(Path(__file__).resolve().parents[1]),
     )
     assert proc.returncode == 0, proc.stderr.decode(errors="replace")

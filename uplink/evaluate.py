@@ -29,6 +29,9 @@ class EvalResult:
     mrr_sum: float = 0.0
     k: int = 5
     misses: list[str] = field(default_factory=list)
+    # One row per fixture: {"q", "rank" (0 = miss), "top_path"} — consumed by
+    # the quality report so it never has to re-run the searches.
+    per_question: list[dict] = field(default_factory=list)
 
     @property
     def mrr(self) -> float:
@@ -85,6 +88,9 @@ def run_eval(db_path: str | Path, fixtures_path: str | Path, k: int = 5) -> Eval
         hits = search(db_path, fx["q"], k=k)
         rank = next(
             (i for i, h in enumerate(hits, start=1) if _matches(h, fx["expect"])), 0
+        )
+        result.per_question.append(
+            {"q": fx["q"], "rank": rank, "top_path": hits[0].path if hits else ""}
         )
         if rank == 1:
             result.hit_at_1 += 1

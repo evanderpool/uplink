@@ -9,3 +9,7 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Generated reports contain corpus content - the capability is public,
+# your outputs are not.
+reports/
