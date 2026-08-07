@@ -315,3 +315,125 @@ def test_answer_vote_still_requires_an_indexed_path(tmp_path: Path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ------------------------------------------------------------ retrieval gaps
+
+@pytest.fixture
+def gapped(tmp_path: Path):
+    from uplink import db as _db
+    from uplink.indexer import index_folder
+
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "leave.md").write_text(
+        "# Leave\n\n## Paid time off\n\nStaff accrue paid time off each month.",
+        encoding="utf-8")
+    dbp = tmp_path / "u.db"
+    index_folder(root, dbp, collection="hr")
+    return dbp, _db
+
+
+def test_unknown_term_detector_names_the_missing_word(gapped, tmp_path: Path):
+    """The corpus says 'paid time off'; the user asked for 'PTO'. Naming the
+    term that matches nothing is the actionable half of the loop."""
+    dbp, _db = gapped
+    log = tmp_path / "query-log.jsonl"
+    append_jsonl(log, {"ts": "t1", "q": "what is our PTO accrue rate", "hits": 0})
+
+    conn = _db.connect_ro(dbp)
+    try:
+        g = metrics.gaps(conn, log)
+    finally:
+        conn.close()
+
+    assert [z["q"] for z in g["zero_hit"]] == ["what is our PTO accrue rate"]
+    terms = [u["term"].lower() for u in g["unknown_terms"]]
+    assert "pto" in terms, "the term the corpus never uses must be named"
+    # Words the corpus DOES contain are not reported as missing — otherwise
+    # every failed query would dump its whole vocabulary here.
+    assert "accrue" not in terms
+
+
+def test_gaps_ignore_successful_and_non_search_entries(gapped, tmp_path: Path):
+    dbp, _db = gapped
+    log = tmp_path / "query-log.jsonl"
+    append_jsonl(log, {"ts": "t1", "q": "paid time off", "hits": 3})
+    append_jsonl(log, {"ts": "t2", "kind": "doc", "path": "leave.md"})
+    conn = _db.connect_ro(dbp)
+    try:
+        g = metrics.gaps(conn, log)
+    finally:
+        conn.close()
+    assert g["zero_hit"] == []
+    assert g["unknown_terms"] == []
+
+
+def test_repeated_failures_rank_first(gapped, tmp_path: Path):
+    """A question asked three times and never answered matters more than one
+    asked once."""
+    dbp, _db = gapped
+    log = tmp_path / "query-log.jsonl"
+    for _ in range(3):
+        append_jsonl(log, {"ts": "t", "q": "zzz repeated miss", "hits": 0})
+    append_jsonl(log, {"ts": "t", "q": "yyy single miss", "hits": 0})
+    conn = _db.connect_ro(dbp)
+    try:
+        g = metrics.gaps(conn, log)
+    finally:
+        conn.close()
+    assert g["zero_hit"][0]["q"] == "zzz repeated miss"
+    assert g["zero_hit"][0]["count"] == 3
+
+
+def test_gaps_skip_stopwords_and_short_tokens(gapped, tmp_path: Path):
+    """'the' matching nothing is noise, not a finding."""
+    dbp, _db = gapped
+    log = tmp_path / "query-log.jsonl"
+    append_jsonl(log, {"ts": "t", "q": "is the qq zzzunknownword", "hits": 0})
+    conn = _db.connect_ro(dbp)
+    try:
+        terms = [u["term"].lower() for u in metrics.gaps(conn, log)["unknown_terms"]]
+    finally:
+        conn.close()
+    assert "zzzunknownword" in terms
+    assert "is" not in terms and "the" not in terms and "qq" not in terms
+
+
+def test_promote_endpoint_closes_the_loop(tmp_path: Path):
+    import json as _json
+
+    from test_webapp import _make_server, _post
+
+    httpd, url, db_path = _make_server(tmp_path, writes_enabled=True)
+    try:
+        _post(url + "/api/feedback",
+              _json.dumps({"q": "how do restarts work", "path": "runbook.md",
+                           "vote": "up"}).encode(), "application/json")
+        code, resp = _post(url + "/api/promote", b"{}", "application/json")
+        assert code == 200, resp
+        assert _json.loads(resp)["added"] == 1
+
+        # Idempotent: promoting again adds nothing.
+        code, resp = _post(url + "/api/promote", b"{}", "application/json")
+        assert _json.loads(resp)["added"] == 0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    fixture = _json.loads(
+        (tmp_path / "fixtures" / "promoted.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert fixture["expect"] == ["runbook.md"]
+
+
+def test_promote_refused_when_not_loopback(tmp_path: Path):
+    from test_webapp import _make_server, _post
+
+    httpd, url, _ = _make_server(tmp_path, writes_enabled=False)
+    try:
+        code, _ = _post(url + "/api/promote", b"{}", "application/json")
+        assert code == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

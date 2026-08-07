@@ -860,6 +860,12 @@ const GLOSSARY = {
   "awaiting": ["Awaiting promotion",
     "Upvotes not yet converted into fixtures — the actionable backlog of the self-improvement loop.",
     "python -m uplink promote"],
+  "zero-hit queries": ["Searches that found nothing",
+    "Questions the corpus could not answer in the words they were asked. Each one is a concrete retrieval failure with a known question.",
+    "data/query-log.jsonl"],
+  "missing terms": ["Terms absent from the index",
+    "Words from failed searches that match NO passage anywhere. This separates the two causes of failure: the corpus lacks the topic, or it holds it under different words. The second is fixable.",
+    "SELECT ... FROM chunks_fts WHERE chunks_fts MATCH"],
   "median latency": ["Median search latency",
     "BM25 query time over the SQLite FTS5 index. Retrieval only; it excludes answer generation.",
     "data/query-log.jsonl"],
@@ -963,6 +969,7 @@ async function loadMetrics() {
   if (m.error) return;
   renderAccuracy(m);
   renderFailing(m.live || {});
+  renderGaps(m.gaps || {});
   renderAnswers(m.answers || {});
   renderFeedback(m.feedback || {});
   renderPerformance(m.performance || {});
@@ -1074,6 +1081,74 @@ function renderAnswers(a) {
   box.appendChild(metricRow("saved", fmtPct(a.save_rate), "", "saved"));
 }
 
+function renderGaps(g) {
+  const box = $("gaps");
+  box.replaceChildren();
+  cardTitle(box, "Retrieval gaps");
+
+  const zero = Array.isArray(g.zero_hit) ? g.zero_hit : [];
+  const unknown = Array.isArray(g.unknown_terms) ? g.unknown_terms : [];
+
+  if (!zero.length && !unknown.length) {
+    box.appendChild(el("p", "micro",
+      "No failed searches recorded. Gaps appear here as soon as a query " +
+      "comes back empty."));
+    return;
+  }
+
+  box.appendChild(metricRow("zero-hit queries", String(g.zero_hit_total || zero.length),
+                            (g.zero_hit_total || 0) > 0 ? "warn" : "",
+                            "zero-hit queries"));
+
+  // The actionable half: a term that matches nothing is the REASON its
+  // query matched nothing, and it names the vocabulary to add.
+  if (unknown.length) {
+    box.appendChild(metricRow("missing terms", String(unknown.length), "warn",
+                              "missing terms"));
+    unknown.forEach((u) => {
+      const row = el("div", "issue issue-bad");
+      row.appendChild(el("span", "issue-tag", "no match"));
+      const body = el("span", "issue-q");
+      body.appendChild(el("strong", null, String(u.term)));
+      const uses = Array.isArray(u.queries) ? u.queries.length : 0;
+      if (uses) body.appendChild(document.createTextNode(
+        " \u00B7 used in " + uses + (uses === 1 ? " query" : " queries")));
+      row.appendChild(body);
+      box.appendChild(row);
+    });
+  }
+
+  zero.forEach((z) => {
+    const row = el("div", "issue");
+    row.appendChild(el("span", "issue-tag", z.count > 1 ? z.count + "x" : "empty"));
+    const q = el("button", "issue-q issue-link", z.q);
+    q.type = "button";
+    q.title = "Run this query again";
+    q.addEventListener("click", () => { $("q").value = z.q; runSearch(); });
+    row.appendChild(q);
+    box.appendChild(row);
+  });
+
+  box.appendChild(el("p", "micro",
+    unknown.length
+      ? "A missing term means the corpus likely covers the topic under other " +
+        "words - add a document, or search the synonym."
+      : "Each failed query is a question your corpus could not answer as asked."));
+}
+
+function promoteFixtures(btn) {
+  btn.disabled = true;
+  btn.textContent = "promoting\u2026";
+  postJSON("/api/promote", {}).then((out) => {
+    btn.disabled = false;
+    if (out.error) { btn.textContent = "promote failed"; return; }
+    btn.textContent = out.added
+      ? "promoted " + out.added
+      : "nothing new to promote";
+    loadMetrics();
+  });
+}
+
 function renderFeedback(f) {
   const box = $("feedback-metrics");
   box.replaceChildren();
@@ -1097,6 +1172,16 @@ function renderFeedback(f) {
     row.appendChild(el("span", "mrow-v", "+" + d.up + " / -" + d.down));
     box.appendChild(row);
   });
+
+  // Close the loop without leaving the workspace.
+  if (state.writes && f.pending_promotion) {
+    const act = el("div", "card-actions");
+    const btn = el("button", "mini", "Promote " + f.pending_promotion + " to fixtures");
+    btn.type = "button";
+    btn.addEventListener("click", () => promoteFixtures(btn));
+    act.appendChild(btn);
+    box.appendChild(act);
+  }
 }
 
 function renderPerformance(p) {

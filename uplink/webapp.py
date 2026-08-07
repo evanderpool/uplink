@@ -72,7 +72,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import asks, db, metrics
 from .extractors import SUPPORTED_EXTENSIONS
-from .feedback import VALID_VOTES, append_jsonl
+from .feedback import VALID_VOTES, append_jsonl, promote
 from .notes import add_note, delete_note, list_notes
 from .originals import OriginalUnavailable, is_viewable, resolve_original
 from .search import hits_to_dicts, search
@@ -353,6 +353,8 @@ def make_handler(
                     self._api_feedback()
                 elif url.path == "/api/ask":
                     self._api_ask()
+                elif url.path == "/api/promote":
+                    self._api_promote()
                 elif url.path == "/api/notes":
                     self._api_note_add()
                 elif url.path == "/api/notes/delete":
@@ -871,6 +873,24 @@ def make_handler(
             if not isinstance(payload, dict):
                 raise ValueError("expected a JSON object")
             return payload
+
+        def _api_promote(self) -> None:
+            """Turn thumbs-up votes into golden-question fixtures.
+
+            The same operation as `uplink promote`, exposed so the loop can
+            be closed without leaving the workspace. Localhost-gated like
+            every write: it appends to the project's fixture file.
+            """
+            self._drain()
+            added, skipped = promote(feedback_log, fixtures / "promoted.jsonl")
+            self._json(
+                200,
+                {
+                    "added": added,
+                    "skipped": skipped,
+                    "fixtures": str((fixtures / "promoted.jsonl").as_posix()),
+                },
+            )
 
         def _api_note_add(self) -> None:
             payload = self._json_body(MAX_NOTE_BYTES)

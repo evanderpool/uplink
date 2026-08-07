@@ -339,6 +339,66 @@ def feedback_loop(feedback_log: Path, promoted: Path | None = None) -> dict:
     }
 
 
+def gaps(conn: sqlite3.Connection, query_log: Path, limit: int = 8) -> dict:
+    """Where retrieval is failing, and — where possible — why.
+
+    Every search that returned nothing is a question the corpus could not
+    answer in the words it was asked. Splitting those queries into terms and
+    checking each against the FTS index separates the two very different
+    causes: the corpus genuinely lacks the topic, or it holds it under
+    different words. The second is fixable, and naming the missing term is
+    the actionable half of the self-improvement loop.
+    """
+    from .search import _STOPWORDS, _WORD_RE
+
+    rows = _tail_jsonl(query_log)
+    failed: dict[str, dict] = {}
+    for row in rows:
+        if row.get("kind") in ("doc", "original"):
+            continue
+        query = str(row.get("q") or "").strip()
+        if not query or row.get("hits"):
+            continue
+        entry = failed.setdefault(
+            query.lower(), {"q": query, "count": 0, "last": row.get("ts", "")}
+        )
+        entry["count"] += 1
+        entry["last"] = row.get("ts", entry["last"])
+
+    zero_hit = sorted(
+        failed.values(), key=lambda e: (e["count"], e["last"]), reverse=True
+    )[:limit]
+
+    # Which individual terms appear nowhere in the index? A term that matches
+    # nothing on its own is the reason its whole query matched nothing.
+    unknown: dict[str, dict] = {}
+    for entry in failed.values():
+        for word in _WORD_RE.findall(entry["q"]):
+            token = word.lower()
+            if len(token) < 3 or token in _STOPWORDS or token in unknown:
+                continue
+            try:
+                hit = conn.execute(
+                    "SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT 1",
+                    (f'"{word}"',),
+                ).fetchone()
+            except sqlite3.Error:
+                continue
+            if hit is None:
+                unknown[token] = {"term": word, "queries": []}
+        for token, info in unknown.items():
+            if token in entry["q"].lower() and entry["q"] not in info["queries"]:
+                info["queries"].append(entry["q"])
+
+    return {
+        "zero_hit": zero_hit,
+        "zero_hit_total": len(failed),
+        "unknown_terms": sorted(
+            unknown.values(), key=lambda u: len(u["queries"]), reverse=True
+        )[:limit],
+    }
+
+
 def collect(
     conn: sqlite3.Connection,
     history_path: Path,
@@ -369,4 +429,5 @@ def collect(
         "performance": performance(query_log),
         "answers": answers(asks_dir, query_log, notes_path) if asks_dir else {"answered": 0},
         "feedback": feedback_loop(feedback_log, promoted),
+        "gaps": gaps(conn, query_log),
     }

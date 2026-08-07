@@ -719,3 +719,10 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 .composer-foot { display: flex; align-items: center; gap: 10px; margin-top: 8px;
                  padding-left: 20px; }
 .composer-foot .micro { flex: 1; min-height: 14px; margin: 0; }
+
+.issue-link {
+  background: none; padding: 0; text-align: left; color: var(--ink-2);
+  border-bottom: 1px dotted var(--line-2); cursor: pointer;
+}
+.issue-link:hover { color: var(--brand-1); border-bottom-color: var(--brand-1); }
+.issue-q strong { color: var(--brand-3); font-weight: 750; }
