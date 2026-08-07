@@ -613,6 +613,8 @@ def make_handler(
                     "collections": collections,
                     "writes": writes_enabled,
                     "build": build_id(),
+                    "extensions": sorted(SUPPORTED_EXTENSIONS),
+                    "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "reports": _available_reports(reports_dir),
                 },
             )
@@ -954,8 +956,10 @@ def make_handler(
             body = self._read_body(MAX_UPLOAD_BYTES)
             fields = parse_multipart(body, ctype)
             filename_raw, file_bytes = fields.get("file", ("", b""))
-            if not filename_raw or not file_bytes:
+            if not filename_raw:
                 raise ValueError("missing file field")
+            if not file_bytes:
+                raise ValueError("the file is empty")
             _, coll_bytes = fields.get("collection", ("", b""))
             collection = db.validate_collection(
                 coll_bytes.decode("utf-8", "replace").strip() or db.DEFAULT_COLLECTION

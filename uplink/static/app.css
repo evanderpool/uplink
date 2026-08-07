@@ -773,3 +773,69 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 .upitem-failed .upitem-note { color: var(--bad); }
 .upitem-body { flex: 1; min-width: 0; }
 .upitem-file { font-size: 10px; color: var(--muted); overflow-wrap: anywhere; margin-top: 1px; }
+
+/* ─────────────────────────── add-sources dialog ─────────────────────── */
+
+.addbox {
+  position: fixed; z-index: 9; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(600px, 94vw); max-height: 88vh;
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r-lg); box-shadow: var(--sh-3);
+}
+.addbox-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 20px 22px 12px;
+}
+.addbox-head h2 { font-size: 16px; letter-spacing: -0.02em; }
+.addbox-head .icon-btn { margin-left: auto; }
+.addbox-tabs { padding: 0 22px; }
+.addbox-body { flex: 1; overflow-y: auto; padding: 16px 22px 4px; min-height: 0; }
+.addbox-foot {
+  display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+  padding: 14px 22px; border-top: 1px solid var(--line);
+}
+.addbox-collection { flex: 1; min-width: 220px; }
+.addbox-actions { display: flex; gap: 8px; }
+.addbox-msg { padding: 0 22px 16px; min-height: 14px; }
+
+.field-label {
+  display: block; font-size: 10.5px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .06em; margin-bottom: 5px;
+}
+.field {
+  width: 100%; background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 9px 12px; font-size: 13px; outline: none;
+  transition: border-color .2s var(--ease-out), box-shadow .2s var(--ease-out);
+}
+.field:focus { border-color: var(--brand-1);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-1) 15%, transparent); }
+.field-area { resize: vertical; line-height: 1.55; font-family: inherit; }
+.collection-row { display: grid; gap: 8px; }
+#pane-text .field { margin-bottom: 12px; }
+
+.analysis {
+  margin: 10px 0 4px; padding: 9px 12px; font-size: 11.5px; font-weight: 600;
+  color: var(--ink-2); background: color-mix(in srgb, var(--brand-1) 8%, transparent);
+  border-radius: var(--r-sm);
+}
+
+.upitem-type {
+  flex: none; width: 34px; text-align: center; font-size: 9px; font-weight: 800;
+  letter-spacing: .04em; color: var(--brand-2); padding: 3px 0; border-radius: 5px;
+  background: color-mix(in srgb, var(--brand-2) 13%, transparent);
+}
+.upitem-blocked { opacity: .75; }
+.upitem-blocked .upitem-type { color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 13%, transparent); }
+.upitem-blocked .upitem-note { color: var(--bad); }
+.upitem-x { flex: none; color: var(--muted); font-size: 11px; padding: 0 2px; }
+.upitem-x:hover { color: var(--bad); }
+.upqueue { max-height: 240px; }
+
+@media (max-width: 640px) {
+  .addbox { width: 96vw; max-height: 92vh; }
+  .addbox-foot { flex-direction: column; align-items: stretch; }
+}

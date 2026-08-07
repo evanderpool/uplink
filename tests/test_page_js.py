@@ -607,11 +607,11 @@ def test_queue_dedupes_and_reports_count():
                        {name:"a.pdf", size:10}];
         const added = queueFiles(files);
         console.log(JSON.stringify({added: added, queued: uploadQueue.length,
-                                    msg: $("upmsg").textContent}));
-    """), functions=("queueFiles", "renderQueue"))
+                                    msg: $("analysis").textContent}));
+    """), functions=("extOf", "fmtBytes", "analyse", "renderAnalysis", "renderQueue", "queueFiles"))
     assert out["added"] == 2, "the same file picked twice must queue once"
     assert out["queued"] == 2
-    assert "2 files ready" in out["msg"]
+    assert "2 files" in out["msg"]
 
 
 def test_queue_renders_a_row_per_file_with_state():
@@ -624,7 +624,7 @@ def test_queue_renders_a_row_per_file_with_state():
                                              || /^upitem-/.test(n.className) === false
                                                 && n.className.indexOf("upitem") === 0);
         console.log(JSON.stringify({text: $("upqueue").textContent}));
-    """), functions=("queueFiles", "renderQueue"))
+    """), functions=("extOf", "fmtBytes", "analyse", "renderAnalysis", "renderQueue", "queueFiles"))
     assert "one.pdf" in out["text"] and "12 passages" in out["text"]
     assert "two.pdf" in out["text"] and "unsupported file type" in out["text"]
 
@@ -655,8 +655,8 @@ def test_batch_refreshes_once_not_per_file():
     src = _extract("processQueue")
     body = src[src.index("for (const item of pending)"):]
     loop = body[:body.index("uploading = false")]
-    assert "loadSources()" not in loop and "scheduleMetrics(" not in loop
-    assert "loadSources()" in src and "scheduleMetrics(" in src
+    assert "refreshAfterImport()" not in loop, "refreshing per file re-scores repeatedly"
+    assert "refreshAfterImport()" in src, "the batch must refresh when it finishes"
 
 
 def test_busy_index_is_retried_once():
@@ -678,7 +678,7 @@ def test_queue_shows_the_real_label_once_indexed():
         uploadQueue[0].note = "75 passages";
         renderQueue();
         console.log(JSON.stringify({before: before, after: $("upqueue").textContent}));
-    """), functions=("queueFiles", "renderQueue"))
+    """), functions=("extOf", "fmtBytes", "analyse", "renderAnalysis", "renderQueue", "queueFiles"))
     # Before indexing there is no title yet, so the filename stands in.
     assert "ma658_macbook_air_late2008_userguide.pdf" in out["before"]
     # After, the document's real name leads and the filename stays visible.
@@ -693,3 +693,103 @@ def test_an_already_indexed_file_does_not_look_like_a_failure():
     src = _extract("uploadOne")
     assert "already indexed" in src
     assert "data.indexed === 0" in src
+
+
+# ------------------------------- the add-sources dialog
+
+def test_files_are_analysed_before_anything_is_sent():
+    """An unsupported or oversized file should be visible immediately, not
+    discovered when it fails mid-batch."""
+    out = _run(textwrap.dedent("""
+        state.extensions = [".pdf", ".md", ".txt"];
+        state.maxUpload = 1000;
+        queueFiles([
+          {name: "good.pdf", size: 500},
+          {name: "installer.exe", size: 500},
+          {name: "huge.pdf", size: 5000},
+          {name: "empty.md", size: 0},
+        ]);
+        console.log(JSON.stringify({
+          states: uploadQueue.map((q) => q.state),
+          notes: uploadQueue.map((q) => q.note),
+          summary: $("analysis").textContent,
+        }));
+    """), functions=("extOf", "fmtBytes", "analyse", "renderAnalysis",
+                     "renderQueue", "queueFiles"))
+    assert out["states"] == ["waiting", "blocked", "blocked", "blocked"]
+    assert out["notes"][1] == "unsupported type"
+    assert "over" in out["notes"][2]
+    assert out["notes"][3] == "file is empty"
+    assert "1 file" in out["summary"] and "3 cannot be added" in out["summary"]
+
+
+def test_analysis_summarises_types_and_size():
+    out = _run(textwrap.dedent("""
+        state.extensions = [".pdf", ".md"];
+        state.maxUpload = 0;
+        queueFiles([{name:"a.pdf", size:1024}, {name:"b.pdf", size:1024},
+                    {name:"c.md", size:2048}]);
+        console.log(JSON.stringify({summary: $("analysis").textContent}));
+    """), functions=("extOf", "fmtBytes", "analyse", "renderAnalysis",
+                     "renderQueue", "queueFiles"))
+    assert "3 files" in out["summary"]
+    assert "2 PDF" in out["summary"] and "1 MD" in out["summary"]
+    assert "4 KB" in out["summary"]
+
+
+def test_collection_choice_offers_existing_and_new():
+    out = _run(textwrap.dedent("""
+        state.collections = [{name:"apple", documents:247}, {name:"ops", documents:5}];
+        state.collection = "ops";
+        fillCollectionChoices();
+        const sel = $("add-coll");
+        console.log(JSON.stringify({
+          options: sel.childNodes.map((o) => o.value),
+          chosen: sel.value,
+          newHidden: $("add-newcoll").hidden,
+        }));
+    """), functions=("fillCollectionChoices", "syncCollectionChoice"))
+    assert out["options"] == ["apple", "ops", "__new__"]
+    assert out["chosen"] == "ops", "the collection in view should be preselected"
+    assert out["newHidden"] is True
+
+
+def test_choosing_new_collection_reveals_the_name_field():
+    out = _run(textwrap.dedent("""
+        state.collections = [{name:"apple", documents:1}];
+        fillCollectionChoices();
+        $("add-coll").value = "__new__";
+        syncCollectionChoice();
+        console.log(JSON.stringify({hidden: $("add-newcoll").hidden,
+                                    note: $("coll-note").textContent}));
+    """), functions=("fillCollectionChoices", "syncCollectionChoice"))
+    assert out["hidden"] is False
+    assert "new collection" in out["note"].lower()
+
+
+def test_chosen_collection_prefers_the_typed_name_when_new():
+    out = _run(textwrap.dedent("""
+        state.collections = [{name:"apple", documents:1}];
+        fillCollectionChoices();
+        $("add-coll").value = "apple";
+        const existing = chosenCollection();
+        $("add-coll").value = "__new__";
+        $("add-newcoll").value = "  Legal Docs  ";
+        console.log(JSON.stringify({existing: existing, made: chosenCollection()}));
+    """), functions=("fillCollectionChoices", "syncCollectionChoice", "chosenCollection"))
+    assert out["existing"] == "apple"
+    assert out["made"] == "legal docs", "trimmed and lowercased before validation"
+
+
+def test_pasted_text_becomes_a_markdown_source():
+    """Typing a note must go through the same indexing path as a file, so it
+    is chunked, cited and verifiable like any other source."""
+    src = _extract("importPastedText")
+    assert 'new File(' in src and '".md"' in src
+    assert '"# " + title' in src, "the title becomes the document heading"
+    assert "uploadOne(" in src, "it takes the ordinary upload path"
+
+
+def test_dialog_will_not_close_mid_batch():
+    src = _extract("closeAddBox")
+    assert "if (uploading) return" in src

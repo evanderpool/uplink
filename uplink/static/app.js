@@ -112,6 +112,13 @@ async function loadStatus() {
     $("stale").hidden = false;
   }
   state.reports = Array.isArray(s.reports) ? s.reports : [];
+  state.collections = Array.isArray(s.collections) ? s.collections : [];
+  state.extensions = Array.isArray(s.extensions) ? s.extensions : [];
+  state.maxUpload = Number(s.max_upload_bytes) || 0;
+  const types = $("drop-types");
+  if (types && state.extensions.length) {
+    types.textContent = state.extensions.map((e) => e.replace('.', '')).join(' · ');
+  }
 
   $("index-meta").textContent =
     "last indexed " + (s.last_indexed || "never") +
@@ -698,10 +705,14 @@ function closeReader() {
 $("reader-close").addEventListener("click", closeReader);
 $("tab-original").addEventListener("click", () => showTab("original"));
 $("tab-text").addEventListener("click", () => showTab("text"));
-$("scrim").addEventListener("click", closeReader);
+$("scrim").addEventListener("click", () => {
+  if (!$("addbox").hidden) closeAddBox();
+  if (!$("reader").hidden) closeReader();
+});
 document.addEventListener("keydown", (ev) => {
   if (ev.key !== "Escape") return;
   hideTip();
+  if (!$("addbox").hidden) closeAddBox();
   if (!$("reader").hidden) closeReader();
 });
 
@@ -1317,59 +1328,165 @@ async function loadNotes() {
 
 /* ------------------------------------------------------------------ upload */
 
-$("add-source").addEventListener("click", () => {
-  const form = $("upload-form");
-  form.hidden = !form.hidden;
-  if (!form.hidden) anim(form, { opacity: 0, y: -8, duration: 0.32, ease: "power2.out" });
-});
+/* ------------------------------------------------------- add-sources dialog */
 
-/* ------------------------------------------------------------ upload queue */
-
-// Files are uploaded ONE AT A TIME even though many are selected at once:
-// each upload triggers a re-index that takes the database write lock, so
-// firing them in parallel would only produce lock contention. Sequential
-// also means every file gets its own visible outcome instead of one
-// aggregate success or failure.
 const uploadQueue = [];
 let uploading = false;
+
+function openAddBox() {
+  state.returnFocus = document.activeElement;
+  $("addbox").hidden = false;
+  $("scrim").hidden = false;
+  fillCollectionChoices();
+  showAddTab("files");
+  anim($("addbox"), { y: 18, opacity: 0, duration: 0.34, ease: "power3.out" });
+  $("addbox-close").focus();
+}
+
+function closeAddBox() {
+  if (uploading) return;   // never vanish mid-batch
+  $("addbox").hidden = true;
+  if ($("reader").hidden) $("scrim").hidden = true;
+  const back = state.returnFocus;
+  state.returnFocus = null;
+  if (back && typeof back.focus === "function") back.focus();
+}
+
+function showAddTab(which) {
+  const files = which === "files";
+  $("pane-files").hidden = !files;
+  $("pane-text").hidden = files;
+  $("tab-files").className = "tab" + (files ? " is-on" : "");
+  $("tab-text").className = "tab" + (files ? "" : " is-on");
+  $("upgo").textContent = files ? "Add to collection" : "Add note";
+}
+
+// The collection is chosen here, not typed blind: existing ones come from
+// the index, and a new one is created simply by naming it.
+function fillCollectionChoices() {
+  const sel = $("add-coll");
+  const keep = sel.value;
+  sel.replaceChildren();
+  (state.collections || []).forEach((c) => {
+    const o = document.createElement("option");
+    o.value = c.name;
+    o.textContent = c.name + " (" + c.documents + ")";
+    sel.appendChild(o);
+  });
+  const o = document.createElement("option");
+  o.value = "__new__";
+  o.textContent = "+ New collection…";
+  sel.appendChild(o);
+  sel.value = keep || state.collection ||
+    ((state.collections || [])[0] || {}).name || "__new__";
+  syncCollectionChoice();
+}
+
+function syncCollectionChoice() {
+  const isNew = $("add-coll").value === "__new__";
+  $("add-newcoll").hidden = !isNew;
+  const note = $("coll-note");
+  if (isNew) {
+    note.textContent = "Lowercase letters, digits, - or _. A new collection is " +
+      "created the moment the first document lands in it.";
+  } else {
+    note.textContent = "Documents will join this collection.";
+  }
+}
+
+function chosenCollection() {
+  if ($("add-coll").value !== "__new__") return $("add-coll").value;
+  return $("add-newcoll").value.trim().toLowerCase();
+}
+
+/* ------------------------------------------------------------ file analysis */
+
+function extOf(name) {
+  const i = String(name).lastIndexOf(".");
+  return i < 0 ? "" : String(name).slice(i).toLowerCase();
+}
+
+// Each file is checked BEFORE anything is sent, so an unsupported or
+// oversized file is visible immediately rather than failing mid-batch.
+function analyse(file) {
+  const ext = extOf(file.name);
+  const types = state.extensions || [];
+  if (types.length && types.indexOf(ext) < 0) {
+    return { ok: false, why: "unsupported type" };
+  }
+  if (!file.size) return { ok: false, why: "file is empty" };
+  const cap = state.maxUpload || 0;
+  if (cap && file.size > cap) return { ok: false, why: "over " + fmtBytes(cap) };
+  return { ok: true, why: "" };
+}
 
 function queueFiles(list) {
   let added = 0;
   for (const f of list || []) {
     if (uploadQueue.some((q) => q.file.name === f.name && q.file.size === f.size)) continue;
-    uploadQueue.push({ file: f, state: "waiting", note: "", label: "" });
+    const verdict = analyse(f);
+    uploadQueue.push({
+      file: f, label: "", note: verdict.ok ? "" : verdict.why,
+      state: verdict.ok ? "waiting" : "blocked",
+    });
     added += 1;
   }
   renderQueue();
-  if (added) {
-    $("upmsg").textContent = uploadQueue.length +
-      (uploadQueue.length === 1 ? " file ready" : " files ready") + " — press Index them";
-  }
   return added;
 }
 
 function renderQueue() {
   const box = $("upqueue");
   box.replaceChildren();
-  $("upclear").hidden = uploadQueue.length === 0 || uploading;
-  uploadQueue.forEach((item) => {
+  uploadQueue.forEach((item, idx) => {
     const row = el("div", "upitem upitem-" + item.state);
-    row.appendChild(el("span", "upitem-dot"));
+    row.appendChild(el("span", "upitem-type", (extOf(item.file.name) || "?").replace(".", "")));
 
-    // Once indexed, the server sends back the name the document is known
-    // by — show that, and keep the filename underneath so the row still
-    // identifies the file on disk.
     const body = el("div", "upitem-body");
     body.appendChild(el("div", "upitem-name", item.label || item.file.name));
-    if (item.label && item.label !== item.file.name) {
-      body.appendChild(el("div", "upitem-file", item.file.name));
-    }
+    const meta = el("div", "upitem-file");
+    meta.textContent = (item.label ? item.file.name + " · " : "") + fmtBytes(item.file.size);
+    body.appendChild(meta);
     row.appendChild(body);
 
     row.appendChild(el("span", "upitem-note", item.note || item.state));
+
+    if (!uploading) {
+      const drop = el("button", "upitem-x", "✕");
+      drop.type = "button";
+      drop.title = "Remove from this batch";
+      drop.addEventListener("click", () => {
+        uploadQueue.splice(idx, 1);
+        renderQueue();
+      });
+      row.appendChild(drop);
+    }
     box.appendChild(row);
   });
+  renderAnalysis();
 }
+
+function renderAnalysis() {
+  const note = $("analysis");
+  if (!uploadQueue.length) { note.hidden = true; return; }
+  const ready = uploadQueue.filter((q) => q.state !== "blocked");
+  const blocked = uploadQueue.length - ready.length;
+  const bytes = ready.reduce((sum, q) => sum + (q.file.size || 0), 0);
+  const kinds = {};
+  ready.forEach((q) => {
+    const k = (extOf(q.file.name) || "?").replace(".", "");
+    kinds[k] = (kinds[k] || 0) + 1;
+  });
+  const parts = Object.keys(kinds).sort().map((k) => kinds[k] + " " + k.toUpperCase());
+  note.hidden = false;
+  note.textContent =
+    ready.length + (ready.length === 1 ? " file" : " files") +
+    (parts.length ? " (" + parts.join(", ") + ")" : "") +
+    " · " + fmtBytes(bytes) +
+    (blocked ? " · " + blocked + " cannot be added" : "");
+}
+
+/* ---------------------------------------------------------------- importing */
 
 async function uploadOne(item, collection) {
   const fd = new FormData();
@@ -1379,8 +1496,6 @@ async function uploadOne(item, collection) {
     method: "POST", headers: { "X-Uplink": "1" }, body: fd,
   });
   let r = await send();
-  // The indexer holds the write lock for the length of a re-scan; one retry
-  // covers a collision with a CLI index run rather than failing the file.
   if (r.status === 503) {
     await new Promise((done) => setTimeout(done, 1500));
     r = await send();
@@ -1392,51 +1507,102 @@ async function uploadOne(item, collection) {
   } else {
     item.state = "done";
     item.label = data.label || item.file.name;
-    // A file already in the collection re-indexes to zero new passages.
-    // Reporting "0 passages" reads as a failure; it is not one.
     item.note = (data.indexed === 0 && data.unchanged > 0)
       ? "already indexed"
       : data.chunks + (data.chunks === 1 ? " passage" : " passages");
   }
 }
 
+async function importPastedText(collection) {
+  const title = $("text-title").value.trim();
+  const body = $("text-body").value.trim();
+  if (!body) { $("upmsg").textContent = "nothing to add — the text is empty"; return; }
+
+  // A pasted note becomes a Markdown file and takes the ordinary upload
+  // path, so it is chunked, cited and verified like any other source.
+  const safe = (title || "note").toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 60) || "note";
+  const text = (title ? "# " + title + "\n\n" : "") + body;
+  const file = new File([text], safe + ".md", { type: "text/markdown" });
+
+  const item = { file: file, label: "", note: "", state: "waiting" };
+  uploadQueue.length = 0;
+  uploadQueue.push(item);
+  uploading = true;
+  $("upgo").disabled = true;
+  item.state = "indexing";
+  renderQueue();
+  try { await uploadOne(item, collection); }
+  catch (e) { item.state = "failed"; item.note = "upload failed"; }
+  uploading = false;
+  $("upgo").disabled = false;
+  renderQueue();
+  $("upmsg").textContent = item.state === "done"
+    ? "added to '" + collection + "'" : "could not add: " + item.note;
+  if (item.state === "done") {
+    $("text-title").value = ""; $("text-body").value = "";
+    await refreshAfterImport();
+  }
+}
+
+async function refreshAfterImport() {
+  await loadStatus();
+  await loadSources();
+  fillCollectionChoices();
+  scheduleMetrics(200);
+}
+
 async function processQueue() {
+  const collection = chosenCollection();
+  if (!collection) {
+    $("upmsg").textContent = "name the new collection first";
+    $("add-newcoll").focus();
+    return;
+  }
+  if (!/^[a-z0-9][a-z0-9_-]{0,49}$/.test(collection)) {
+    $("upmsg").textContent =
+      "'" + collection + "' is not a valid name — lowercase letters, digits, - or _";
+    return;
+  }
+  if (!$("pane-text").hidden) { await importPastedText(collection); return; }
+
   const pending = uploadQueue.filter((q) => q.state === "waiting" || q.state === "failed");
-  if (!pending.length) { $("upmsg").textContent = "nothing to index"; return; }
+  if (!pending.length) {
+    $("upmsg").textContent = uploadQueue.length
+      ? "nothing left to add" : "choose some files first";
+    return;
+  }
 
   uploading = true;
   $("upgo").disabled = true;
-  const collection = $("upcoll").value.trim() || state.collection || "main";
   let done = 0, failed = 0;
-
   for (const item of pending) {
     item.state = "indexing";
     item.note = "";
     renderQueue();
-    $("upmsg").textContent = "indexing " + (done + failed + 1) + " of " + pending.length +
-      " into '" + collection + "'\u2026";
-    try {
-      await uploadOne(item, collection);
-    } catch (e) {
-      item.state = "failed";
-      item.note = "upload failed";
-    }
+    $("upmsg").textContent = "adding " + (done + failed + 1) + " of " + pending.length +
+      " to '" + collection + "'\u2026";
+    try { await uploadOne(item, collection); }
+    catch (e) { item.state = "failed"; item.note = "upload failed"; }
     if (item.state === "done") done += 1; else failed += 1;
     renderQueue();
   }
-
   uploading = false;
   $("upgo").disabled = false;
-  $("upmsg").textContent = done + " indexed" +
-    (failed ? ", " + failed + " failed \u2014 press Index them to retry those" : "") +
-    " into '" + collection + "'";
-
-  // One refresh for the whole batch rather than one per file.
-  await loadStatus();
-  await loadSources();
-  scheduleMetrics(200);
-  renderQueue();
+  $("upmsg").textContent = done + " added to '" + collection + "'" +
+    (failed ? ", " + failed + " failed — press again to retry those" : "");
+  await refreshAfterImport();
 }
+
+/* ------------------------------------------------------------------ wiring */
+
+$("add-source").addEventListener("click", openAddBox);
+$("addbox-close").addEventListener("click", closeAddBox);
+$("addbox-cancel").addEventListener("click", closeAddBox);
+$("tab-files").addEventListener("click", () => showAddTab("files"));
+$("tab-text").addEventListener("click", () => showAddTab("text"));
+$("add-coll").addEventListener("change", syncCollectionChoice);
+$("upgo").addEventListener("click", processQueue);
 
 $("drop").addEventListener("dragover", (ev) => {
   ev.preventDefault();
@@ -1450,15 +1616,8 @@ $("drop").addEventListener("drop", (ev) => {
 });
 $("file").addEventListener("change", () => {
   queueFiles($("file").files);
-  // Clear the input so re-picking the same file still fires a change event.
-  $("file").value = "";
+  $("file").value = "";   // so re-picking the same file still fires
 });
-$("upclear").addEventListener("click", () => {
-  uploadQueue.length = 0;
-  renderQueue();
-  $("upmsg").textContent = "";
-});
-$("upgo").addEventListener("click", processQueue);
 
 /* ------------------------------------------------------------------- chrome */
 
