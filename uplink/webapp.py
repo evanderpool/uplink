@@ -46,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import db
+from . import asks, db
 from .extractors import SUPPORTED_EXTENSIONS
 from .feedback import VALID_VOTES, append_jsonl
 from .search import hits_to_dicts, search
@@ -131,6 +131,7 @@ def make_handler(
     uploads_root = data_dir / "uploads"
     query_log = data_dir / "query-log.jsonl"
     feedback_log = data_dir / "feedback.jsonl"
+    asks_dir = data_dir / "asks"
     allowed_hosts = {bind_host.lower(), "127.0.0.1", "localhost", "::1", "[::1]"}
     # Serializes browser uploads: index_folder holds a write transaction for
     # its whole run, so without this a second simultaneous upload waits out
@@ -174,6 +175,8 @@ def make_handler(
                     self._api_search(url)
                 elif url.path == "/api/status":
                     self._api_status()
+                elif url.path.startswith("/api/ask/"):
+                    self._api_ask_status(url.path.removeprefix("/api/ask/"))
                 elif url.path.startswith("/reports/"):
                     self._report(url.path)
                 else:
@@ -219,6 +222,8 @@ def make_handler(
                     self._api_upload()
                 elif url.path == "/api/feedback":
                     self._api_feedback()
+                elif url.path == "/api/ask":
+                    self._api_ask()
                 else:
                     self._drain()
                     self._send(404, "text/plain; charset=utf-8", b"not found")
@@ -314,7 +319,38 @@ def make_handler(
                 return
             self._send(200, "text/html; charset=utf-8", page.read_bytes())
 
+        def _api_ask_status(self, ask_id: str) -> None:
+            """Poll one queued question. Read-only: reads the response file
+            the brain session wrote (or reports pending/unknown)."""
+            self._json(200, asks.get_status(asks_dir, ask_id))
+
         # ------------------------------------------------------ writes (localhost)
+
+        def _api_ask(self) -> None:
+            """Queue a question for the brain session (see AGENT.md).
+
+            Behind the localhost-only write gate like every POST: remote
+            ask-only access is exactly what the integration review gates,
+            so today the queue adds zero remote surface."""
+            body = self._read_body(MAX_FEEDBACK_BYTES)
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("expected a JSON body") from None
+            if not isinstance(payload, dict):
+                raise ValueError("expected a JSON object")
+            q = str(payload.get("q") or "").strip()[:MAX_QUERY_LEN]
+            if not q:
+                raise ValueError("missing q")
+            collection = payload.get("collection")
+            if collection:
+                collection = db.validate_collection(str(collection))
+            try:
+                k = min(MAX_K, max(1, int(payload.get("k") or 8)))
+            except (TypeError, ValueError):
+                k = 8
+            req = asks.new_ask(asks_dir, q, collection or None, k=k)
+            self._json(200, {"id": req["id"], "state": "pending"})
 
         def _read_body(self, cap: int) -> bytes:
             try:
@@ -615,6 +651,19 @@ button:disabled { opacity: 0.6; cursor: default; }
 .fb button.done-down { color: var(--bad); border-color: var(--bad); }
 .empty { color: var(--muted); font-size: 13px; padding: 24px 4px; }
 mark { background: none; color: var(--ink); font-weight: 650; }
+#answer { margin: 10px 0; }
+.ans {
+  background: var(--surface); border: 1px solid var(--accent);
+  border-radius: 10px; padding: 14px 16px;
+}
+.ans-label { color: var(--accent); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px; }
+.ans-text { font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ans-cites { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.ans-cites span { color: var(--ink-2); font-size: 11.5px; border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px 9px; overflow-wrap: anywhere; }
+.ans-wait { color: var(--muted); font-size: 12.5px; padding: 10px 2px; }
+button.secondary { background: none; color: var(--accent); border: 1px solid var(--accent); }
 details#up { margin-top: 28px; }
 details#up summary { color: var(--ink-2); font-size: 13px; cursor: pointer; }
 #upform { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
@@ -640,8 +689,10 @@ footer { margin-top: 36px; color: var(--muted); font-size: 11px; }
          placeholder="Ask your documents&hellip;" autofocus>
   <select id="coll" title="Collection"><option value="">all collections</option></select>
   <button id="go" type="submit">Search</button>
+  <button id="ai" type="button" class="secondary" hidden>Ask AI</button>
 </form>
 <div id="meta"></div>
+<div id="answer"></div>
 <div id="results"></div>
 <details id="up" hidden>
   <summary>Add a document</summary>
@@ -680,8 +731,99 @@ async function status() {
       sel.appendChild(o);
     });
     $("up").hidden = !WRITES;
+    $("ai").hidden = !WRITES;
   } catch (e) { $("statusline").textContent = "status unavailable"; }
 }
+
+let pollTimer = null;
+
+function renderAnswer(resp, question) {
+  // Every field is coerced: a malformed response (citations as a string, a
+  // null entry) must never throw here - that would blank the card and
+  // strand the button mid-poll.
+  const box = $("answer");
+  box.replaceChildren();
+  const card = document.createElement("div");
+  card.className = "ans";
+  const label = document.createElement("div");
+  label.className = "ans-label";
+  label.textContent = "AI answer for: " + String(question || "");
+  card.appendChild(label);
+  const text = document.createElement("div");
+  text.className = "ans-text";
+  text.textContent = String(resp.answer || "");
+  card.appendChild(text);
+  const list = Array.isArray(resp.citations) ? resp.citations : [];
+  if (list.length) {
+    const cites = document.createElement("div");
+    cites.className = "ans-cites";
+    list.forEach((c) => {
+      if (!c || typeof c !== "object") return;
+      const path = String(c.path || "");
+      if (!path) return;
+      const chip = document.createElement("span");
+      chip.textContent = path + (c.section ? " > " + String(c.section) : "");
+      cites.appendChild(chip);
+    });
+    if (cites.childNodes.length) card.appendChild(cites);
+  }
+  box.appendChild(card);
+}
+
+function clearAnswer() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  $("answer").replaceChildren();
+  $("ai").disabled = false;
+}
+
+async function askAI() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  LASTQ = q;
+  clearAnswer();
+  $("ai").disabled = true;
+  const box = $("answer");
+  const wait = document.createElement("div");
+  wait.className = "ans-wait";
+  wait.textContent = "queued - waiting for the brain session\\u2026";
+  box.appendChild(wait);
+  try {
+    const r = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Uplink": "1" },
+      body: JSON.stringify({ q: q, collection: $("coll").value || null }),
+    });
+    const data = await r.json();
+    if (data.error) { wait.textContent = "error: " + data.error; $("ai").disabled = false; return; }
+    const started = Date.now();
+    pollTimer = setInterval(async () => {
+      const elapsed = Math.round((Date.now() - started) / 1000);
+      try {
+        const pr = await fetch("/api/ask/" + data.id);
+        const st = await pr.json();
+        if (st.state === "answered") {
+          clearInterval(pollTimer); pollTimer = null;
+          try { renderAnswer(st, q); } finally { $("ai").disabled = false; }
+        } else if (st.state === "error") {
+          clearInterval(pollTimer); pollTimer = null;
+          wait.textContent = "brain error: " + String(st.error || "unknown");
+          $("ai").disabled = false;
+        } else if (elapsed > 180) {
+          clearInterval(pollTimer); pollTimer = null;
+          wait.textContent = "no answer after 3 minutes - is the brain session running with its watcher armed?";
+          $("ai").disabled = false;
+        } else {
+          wait.textContent = "waiting for the brain session\\u2026 " + elapsed + "s";
+        }
+      } catch (e) { /* transient poll failure - keep polling */ }
+    }, 2000);
+  } catch (e) {
+    wait.textContent = "ask failed - is the server still running?";
+    $("ai").disabled = false;
+  }
+}
+
+$("ai").addEventListener("click", askAI);
 
 function renderSnippet(el, snippet) {
   // The API marks matches with non-printable \\u0001/\\u0002 delimiters (so
@@ -767,6 +909,9 @@ $("f").addEventListener("submit", async (ev) => {
   const q = $("q").value.trim();
   if (!q) return;
   LASTQ = q;
+  // A new search retires any AI answer (and cancels an in-flight one):
+  // a cited answer must never sit above the results of a different question.
+  clearAnswer();
   $("go").disabled = true;
   $("meta").textContent = "searching\\u2026";
   try {

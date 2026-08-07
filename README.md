@@ -66,6 +66,8 @@ AI operating system.
   feedback→fixture promotion loop.
 - `uplink/export.py` — JSONL export of documents+chunks (the migration path
   to a future vector store).
+- `uplink/asks.py` — the ask queue: file-pair request/response handoff to
+  whatever LLM session is acting as the brain.
 
 ## Install
 
@@ -94,6 +96,7 @@ python -m uplink serve                                            # web UI at lo
 python -m uplink status                                           # index statistics
 python -m uplink export --collection ops --out ops.jsonl          # docs+chunks as JSONL
 python -m uplink promote                                          # feedback -> fixtures
+python -m uplink asks                                             # questions waiting for the brain
 python -m uplink upgrade --db old.db                              # v0.1 -> collections schema
 ```
 
@@ -138,6 +141,32 @@ promote` turns thumbs-up votes (last vote wins) into golden-question
 fixtures, so the eval suite grows from real usage. Every web search is
 logged to `data/query-log.jsonl` with hit count and latency.
 
+## Ask AI — generated answers without an LLM in the box
+
+Search returns chunks; **Ask AI** returns an answer. Uplink still contains no
+language model — it borrows one. The button queues your question into
+`data/asks/`, an LLM session (Claude Code in the reference deployment) drains
+the queue, reads the retrieved chunks, and writes back a composed answer with
+citations; the page polls and renders it. `AGENT.md` is the contract that
+session follows, and `scripts/watch_asks.py` is the watcher that wakes it.
+
+```
+python scripts/watch_asks.py     # arm the brain session (background)
+python -m uplink asks --json     # what is waiting to be answered
+```
+
+This keeps the privacy story exact: **documents never leave the machine, and
+no third-party API is involved.** The trade-off is availability — answers
+arrive only while a brain session is armed, which is why the button reports
+"waiting for the brain session" and gives up after three minutes.
+
+Questions are untrusted data everywhere they surface: they reach the session
+quoted as JSON string literals so a question can never forge a watcher
+instruction line, and answers render through `textContent` only. The queue
+sits behind the same localhost-only write gate as uploads, capped at 25
+pending, and the watcher will not re-fire an unanswered question for 15
+minutes.
+
 The index lives at `data/uplink.db` by default (`--db` to override) and is
 never committed — it may contain private corpus content.
 
@@ -180,8 +209,9 @@ content, so the capability is public but your outputs are not.
 - **Phase 2 — hybrid retrieval:** local embeddings (fastembed +
   `bge-small-en-v1.5`, CPU-only) + reciprocal rank fusion with BM25, gated on
   before/after eval numbers. EmbeddingGemma noted as the upgrade path.
-- **Phone access:** question queue via the parent system's signed-request
-  bridge pattern (read-only; answers only, no actions).
+- **Phone access:** expose the Ask page over Tailscale (ask-only by
+  construction) and add HMAC-signed ask requests, mirroring the parent
+  system's bridge — gated on the systems-integration review.
 
 ## Design decisions
 
@@ -193,6 +223,7 @@ content, so the capability is public but your outputs are not.
 | Read-only search connections | "The query path can't write" is enforced by SQLite, not by convention |
 | Localhost-only writes | Whether writes exist is decided by the bind address at startup, not by request-time checks an attacker might route around |
 | Collections in one DB, clients in separate DBs | Departments share a search surface; client isolation is a filesystem boundary, not a WHERE clause |
+| Generation by borrowed brain, not an embedded API key | Keeps "documents never leave the machine" literally true and adds no per-question cost; availability is the accepted trade-off |
 | Eval fixtures in-repo | The harness runs against any corpus with one command; the numbers above come from a corpus in a separate (public) repo, so treat them as our measurement, reproducible with that repo cloned |
 
 ## Tests
@@ -201,7 +232,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (109 tests) covers every extractor (including a byte-level
+The suite (143 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on
@@ -211,8 +242,11 @@ corpus content and narrative, chart gap/label semantics, empty-index
 safety), the v1→v2 migration (id preservation, idempotence), collection
 scoping and purge isolation, the localhost-only write rule, CSRF and
 DNS-rebinding defenses, upload constraints (traversal, overwrite, size,
-byte-exactness, cleanup on failure), and the feedback→promote loop — every
-finding from the adversarial reviews is pinned by a regression test.
+byte-exactness, cleanup on failure), the feedback→promote loop, and the ask
+queue (id validation, malformed-response handling, cap-under-concurrency,
+watcher dedup, and the answer-card render contract executed as real
+JavaScript in a DOM shim) — every finding from the adversarial reviews is
+pinned by a regression test.
 
 ## License
 
