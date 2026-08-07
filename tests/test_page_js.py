@@ -335,6 +335,32 @@ def test_doc_key_separates_same_filename_across_collections():
     assert out["a"] != out["b"]
 
 
+def test_hidden_attribute_beats_author_display_rules():
+    """Every panel toggled with `hidden` must actually hide.
+
+    `.reader` sets `display: flex`, which outranks the UA stylesheet's
+    `[hidden] { display: none }` — the source panel rendered on page load
+    and its close button did nothing. A global override fixes the whole
+    class of bug, so assert it exists and that nothing later re-breaks it.
+    """
+    import re
+
+    static = Path(__file__).resolve().parents[1] / "uplink" / "static"
+    css = (static / "app.css").read_text(encoding="utf-8")
+    html = (static / "index.html").read_text(encoding="utf-8")
+
+    override = re.search(r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", css)
+    assert override, "app.css must force [hidden] to win over author display rules"
+
+    # Anything that ships hidden in the markup depends on that rule.
+    assert re.search(r'id="reader"[^>]*\bhidden\b', html)
+    assert re.search(r'id="scrim"[^>]*\bhidden\b', html)
+
+    # And the override must come before the rules it has to beat, since
+    # !important ties would otherwise fall back to source order.
+    assert css.index("[hidden]") < css.index(".reader {")
+
+
 def test_source_and_hit_openers_are_focusable_buttons():
     """Opening a source to verify a claim is the point of the product; it
     must not be mouse-only."""

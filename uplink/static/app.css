@@ -75,6 +75,13 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute is honoured only by the UA stylesheet's
+ * `[hidden] { display: none }`, which ANY author `display` rule outranks.
+ * `.reader` sets `display: flex`, so the source panel rendered on load and
+ * the close button appeared to do nothing. Making the attribute win here
+ * fixes it once for every element that uses it. */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {

@@ -444,7 +444,11 @@ def make_handler(
             if not asset.is_file():
                 self._send(404, "text/plain; charset=utf-8", b"asset missing")
                 return
-            self._send(200, ctype, asset.read_bytes())
+            # Assets are read from disk per request and must never be served
+            # from a stale browser cache: a fix that the operator cannot see
+            # is indistinguishable from no fix at all.
+            self._send(200, ctype, asset.read_bytes(),
+                       extra={"Cache-Control": "no-cache, must-revalidate"})
 
         def _api_sources(self, url) -> None:
             """The documents in a collection, plus opening questions — what
@@ -824,12 +828,15 @@ def make_handler(
             body = json.dumps(payload, ensure_ascii=True).encode("ascii")
             self._send(code, "application/json", body)
 
-        def _send(self, code: int, ctype: str, body: bytes) -> None:
+        def _send(self, code: int, ctype: str, body: bytes,
+                  extra: dict | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
