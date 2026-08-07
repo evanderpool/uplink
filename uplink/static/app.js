@@ -419,6 +419,21 @@ function renderAnswer(card, resp, question) {
   label.appendChild(el("span", null, "answer from your documents"));
   card.appendChild(label);
   card.appendChild(el("div", "answer-text", String(resp.answer || "")));
+
+  // Provenance the reader can see, so drift is visible rather than silent.
+  const used = Array.isArray(resp.sources_used) ? resp.sources_used.length : 0;
+  const passages = Number(resp.passages) || 0;
+  if (used || passages) {
+    const prov = el("div", "provenance");
+    prov.appendChild(el("span", resp.grounding_verified ? "prov-ok" : "prov-warn",
+      resp.grounding_verified ? "✓ grounded" : "! unverified"));
+    prov.appendChild(el("span", null,
+      passages + (passages === 1 ? " passage" : " passages") +
+      " from " + used + (used === 1 ? " document" : " documents") +
+      (resp.scoped ? " · within your selection" : "")));
+    card.appendChild(prov);
+  }
+
   citationList(card, resp.citations, openDoc);
 
   const actions = el("div", "card-actions");
@@ -588,8 +603,13 @@ async function askAI() {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   $("q").value = "";
   try {
+    // The selection must ride along: the brain answers later and cannot
+    // see the checkboxes.
+    const scoping = scopeParams();
     const started = await postJSON("/api/ask", {
       q: q, collection: state.collection || null,
+      scoped: scoping !== "",
+      docs: scoping === "" ? [] : Array.from(state.selected),
     });
     if (started.error) {
       card.replaceChildren(el("p", "err", "error: " + started.error));

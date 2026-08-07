@@ -726,3 +726,13 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 }
 .issue-link:hover { color: var(--brand-1); border-bottom-color: var(--brand-1); }
 .issue-q strong { color: var(--brand-3); font-weight: 750; }
+
+.provenance {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; font-size: 11px; color: var(--muted);
+}
+.prov-ok, .prov-warn {
+  font-weight: 700; border-radius: var(--r-pill); padding: 2px 9px;
+}
+.prov-ok { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.prov-warn { color: var(--brand-3); background: color-mix(in srgb, var(--brand-3) 14%, transparent); }

@@ -756,8 +756,20 @@ def make_handler(
                 k = min(MAX_K, max(1, int(payload.get("k") or 8)))
             except (TypeError, ValueError):
                 k = 8
-            req = asks.new_ask(asks_dir, q, collection or None, k=k)
-            self._json(200, {"id": req["id"], "state": "pending"})
+
+            # The source selection must travel WITH the question. The brain
+            # answers later and cannot see the checkboxes; without this the
+            # answer is composed from documents the operator excluded.
+            docs = None
+            if payload.get("scoped"):
+                raw = payload.get("docs")
+                raw = raw if isinstance(raw, list) else []
+                pairs = _doc_pairs([str(d) for d in raw[:MAX_SOURCE_FILTER]])
+                docs = [f"{coll}/{path}" for coll, path in pairs]
+
+            req = asks.new_ask(asks_dir, q, collection or None, k=k, docs=docs)
+            self._json(200, {"id": req["id"], "state": "pending",
+                             "scoped_to": len(docs) if docs is not None else None})
 
         def _read_body(self, cap: int) -> bytes:
             try:

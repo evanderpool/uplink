@@ -210,6 +210,14 @@ python scripts/watch_asks.py     # arm the brain session (background)
 python -m uplink asks --json     # what is waiting to be answered
 ```
 
+**Answers are grounded mechanically, not on trust.** Before an answer is
+published, every citation is checked against the index and against the
+sources you selected: a citation naming a document that is not indexed, or
+one you deselected, is REFUSED and the answer is never written. The source
+checkboxes travel with the question, so a scoped question is answered only
+from the documents you chose — and the answer card shows what it stood on
+("3 passages from 1 document · within your selection").
+
 This keeps the privacy story exact: **documents never leave the machine, and
 no third-party API is involved.** The trade-off is availability — answers
 arrive only while a brain session is armed, which is why the button reports
@@ -309,7 +317,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (233 tests) covers every extractor (including a byte-level
+The suite (282 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on
