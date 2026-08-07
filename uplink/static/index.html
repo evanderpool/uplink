@@ -129,7 +129,10 @@
           </button>
         </div>
       </div>
-      <p id="meta" class="micro composer-meta"></p>
+      <div class="composer-foot">
+        <p id="meta" class="micro composer-meta"></p>
+        <button id="clear-thread" class="mini" type="button">Clear conversation</button>
+      </div>
     </form>
   </section>
 
@@ -144,6 +147,26 @@
       <div class="stat-grid" id="stat-grid">
         <div class="stat"><span class="stat-n" id="stat-docs">0</span><span class="stat-l">documents</span></div>
         <div class="stat"><span class="stat-n" id="stat-chunks">0</span><span class="stat-l">chunks</span></div>
+      </div>
+
+      <div class="studio-block">
+        <h3>Retrieval accuracy</h3>
+        <div id="accuracy" class="metric-card"></div>
+      </div>
+
+      <div class="studio-block">
+        <h3>Performance</h3>
+        <div id="performance" class="metric-card"></div>
+      </div>
+
+      <div class="studio-block">
+        <h3>Feedback loop</h3>
+        <div id="feedback-metrics" class="metric-card"></div>
+      </div>
+
+      <div class="studio-block">
+        <h3>Corpus health</h3>
+        <div id="health-metrics" class="metric-card"></div>
       </div>
 
       <div class="studio-block">
@@ -170,14 +193,27 @@
 <!-- Source reader: slides in over the workspace when a citation is opened -->
 <aside id="reader" class="reader" hidden aria-label="Source reader">
   <div class="reader-head">
-    <div>
+    <div class="reader-ident">
       <p class="reader-path" id="reader-path"></p>
       <p class="reader-meta micro" id="reader-meta"></p>
     </div>
     <button id="reader-close" class="icon-btn" type="button" aria-label="Close source">✕</button>
   </div>
+
+  <div class="tabs" role="tablist">
+    <button id="tab-original" class="tab" type="button" role="tab">Original file</button>
+    <button id="tab-text" class="tab is-on" type="button" role="tab">Indexed text</button>
+    <a id="reader-download" class="tab tab-link" href="#" download hidden>Download</a>
+  </div>
+
   <div class="reader-body" id="reader-body"></div>
-  <div class="reader-nav">
+  <div class="reader-frame-wrap" id="reader-frame-wrap" hidden>
+    <iframe id="reader-frame" class="reader-frame" title="Original document"
+            sandbox="allow-same-origin"></iframe>
+    <p id="reader-frame-note" class="micro reader-frame-note"></p>
+  </div>
+
+  <div class="reader-nav" id="reader-nav">
     <button id="reader-prev" class="btn btn-soft" type="button">← earlier</button>
     <button id="reader-next" class="btn btn-soft" type="button">later →</button>
     <span class="micro" id="reader-pos"></span>

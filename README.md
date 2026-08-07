@@ -133,12 +133,30 @@ retrieval over them.
   returns cited passages instantly; **Ask AI** returns a written answer.
   The empty state offers opening questions derived from the index itself,
   so a new corpus is never a blank box.
-- **Studio** — index statistics, generated reports, and saved notes. Saving
-  an answer keeps its citations clickable.
+- **Studio** — the metrics surface plus saved notes: retrieval accuracy
+  (hit@1, hit@k, MRR with a trend line, straight from the logged eval
+  history), performance (median and p95 latency, zero-hit rate), the human
+  feedback loop (votes in, fixtures out, and how many upvotes are still
+  awaiting promotion), and corpus health. Nothing is estimated — if a number
+  has not been measured it says so instead of showing a figure.
 
 Click any citation, source name, or result path to open the **source
-reader**: the indexed text, centred on the cited chunk, pageable through the
-document.
+reader**, which shows the document two ways:
+
+- **Original file** — the real PDF/text as stored on disk, rendered in place.
+  A PDF citation opens at the cited page.
+- **Indexed text** — exactly what retrieval read, centred on the cited chunk
+  and pageable through the document.
+
+Serving originals is the one place Uplink reads a corpus file at request
+time, so the path never comes from the client: the (collection, path) pair
+is looked up in the index, joined to that collection's own recorded corpus
+root, resolved, and then required to still be inside it. A document that is
+not indexed cannot be requested at all.
+
+The conversation persists across reloads (stored in the browser, never
+sent anywhere) with a Clear control, and sources are listed by readable
+title with their filename, type, size, and passage count underneath.
 
 The interface is served from `uplink/static/` — plain HTML, CSS, and
 JavaScript with no build step and no framework. One library is vendored
@@ -278,7 +296,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (205 tests) covers every extractor (including a byte-level
+The suite (233 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on

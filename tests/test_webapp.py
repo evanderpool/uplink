@@ -30,8 +30,12 @@ def _make_server(tmp_path: Path, writes_enabled: bool):
     reports.mkdir(exist_ok=True)
     (reports / "health.html").write_text("<!doctype html><title>h</title>ok", encoding="utf-8")
 
+    # An isolated fixtures dir: a test server must never report the repo's
+    # eval history as if it were this corpus's accuracy.
     httpd = ThreadingHTTPServer(
-        ("127.0.0.1", 0), make_handler(db_path, reports, writes_enabled)
+        ("127.0.0.1", 0),
+        make_handler(db_path, reports, writes_enabled,
+                     fixtures_dir=tmp_path / "fixtures"),
     )
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

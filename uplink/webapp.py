@@ -70,10 +70,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import asks, db
+from . import asks, db, metrics
 from .extractors import SUPPORTED_EXTENSIONS
 from .feedback import VALID_VOTES, append_jsonl
 from .notes import add_note, delete_note, list_notes
+from .originals import OriginalUnavailable, is_viewable, resolve_original
 from .search import hits_to_dicts, search
 from .suggest import suggestions
 
@@ -115,6 +116,40 @@ def _int_param(params: dict, name: str, default: int | None) -> int | None:
     if not -_INT64_MAX <= value <= _INT64_MAX:
         return default
     return value
+
+
+_ACRONYMS = {"pdf", "csv", "tsv", "faq", "sop", "kpi", "api", "sec", "nist", "cdc",
+             "cui", "iot", "sp", "ai", "hr", "it", "us", "eu", "uk", "q1", "q2",
+             "q3", "q4", "fy", "10k", "10q", "8k"}
+
+
+def readable_label(title: str | None, path: str) -> str:
+    """A human-readable name for a document.
+
+    A real title (a PDF's own title, a Markdown H1) is used as-is. When the
+    extractor could only fall back to the filename, the filename is tidied
+    into something a person would read — separators become spaces, words are
+    capitalised, and known acronyms stay upper-case — because
+    'nist-sp-800-53r5-security-controls' is a filename, not a label.
+    """
+    stem = Path(path).stem
+    clean = (title or "").strip()
+    if clean and clean.lower() != stem.lower():
+        return clean
+
+    words = re.split(r"[-_.\s]+", stem)
+    out = []
+    for w in words:
+        if not w:
+            continue
+        low = w.lower()
+        if low in _ACRONYMS:
+            out.append(w.upper())
+        elif any(ch.isdigit() for ch in w):
+            out.append(w.upper() if len(w) <= 6 else w)
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out) or stem
 
 
 def _doc_pairs(raw: list[str] | None) -> list[tuple[str, str]]:
@@ -203,6 +238,7 @@ def make_handler(
     reports_dir: Path | None,
     writes_enabled: bool,
     bind_host: str = "127.0.0.1",
+    fixtures_dir: Path | None = None,
 ):
     data_dir = db_path.parent
     uploads_root = data_dir / "uploads"
@@ -210,6 +246,9 @@ def make_handler(
     feedback_log = data_dir / "feedback.jsonl"
     asks_dir = data_dir / "asks"
     notes_path = data_dir / "notes.jsonl"
+    # Eval history belongs to the project, not the CWD: a server on one
+    # database must never report another corpus's accuracy numbers.
+    fixtures = Path(fixtures_dir) if fixtures_dir else Path("fixtures")
     allowed_hosts = {bind_host.lower(), "127.0.0.1", "localhost", "::1", "[::1]"}
     # Serializes browser uploads: index_folder holds a write transaction for
     # its whole run, so without this a second simultaneous upload waits out
@@ -253,6 +292,10 @@ def make_handler(
                     self._static(url.path.removeprefix("/static/"))
                 elif url.path == "/api/sources":
                     self._api_sources(url)
+                elif url.path == "/api/metrics":
+                    self._api_metrics()
+                elif url.path == "/api/file":
+                    self._api_file(url)
                 elif url.path == "/api/notes":
                     self._api_notes(url)
                 elif url.path == "/api/search":
@@ -474,15 +517,93 @@ def make_handler(
                 ).fetchall()
                 collections = db.list_collections(conn)
                 prompts = suggestions(conn, collection)
+                roots = {
+                    r["key"].removeprefix("corpus_root:"): r["value"]
+                    for r in conn.execute(
+                        "SELECT key, value FROM meta WHERE key LIKE 'corpus_root:%'"
+                    )
+                }
             finally:
                 conn.close()
+
+            sources = []
+            for r in rows:
+                item = dict(r)
+                item["label"] = readable_label(r["title"], r["path"])
+                item["filename"] = Path(r["path"]).name
+                item["viewable"] = is_viewable(r["path"])
+                # Whether an "Original" tab can work at all: uploads-only
+                # collections and moved folders have no readable source.
+                item["has_original"] = bool(roots.get(r["collection"]))
+                sources.append(item)
+
             self._json(
                 200,
                 {
                     "collection": collection,
                     "collections": collections,
-                    "sources": [dict(r) for r in rows],
+                    "sources": sources,
                     "suggestions": prompts,
+                },
+            )
+
+        def _api_metrics(self) -> None:
+            """Health, accuracy, latency, and the human feedback loop —
+            computed from the index and the local logs, never estimated."""
+            conn = db.connect_ro(db_path)
+            try:
+                payload = metrics.collect(
+                    conn,
+                    history_path=fixtures / "eval-history.jsonl",
+                    query_log=query_log,
+                    feedback_log=feedback_log,
+                    promoted=fixtures / "promoted.jsonl",
+                    db_name=db_path.name,
+                )
+            finally:
+                conn.close()
+            self._json(200, payload)
+
+        def _api_file(self, url) -> None:
+            """Serve the ORIGINAL document behind a citation.
+
+            The only request-time corpus file read in the system. The client
+            names a document; the path comes from the index and is required
+            to resolve inside that collection's own recorded source folder.
+            """
+            params = parse_qs(url.query)
+            path = (params.get("path") or [""])[0].strip()
+            collection = (params.get("collection") or [""])[0].strip()
+            if not path or not collection:
+                self._json(400, {"error": "path and collection are required"})
+                return
+            collection = db.validate_collection(collection)
+            conn = db.connect_ro(db_path)
+            try:
+                asset, ctype = resolve_original(conn, collection, path)
+            except OriginalUnavailable as exc:
+                self._json(404, {"error": str(exc)})
+                return
+            finally:
+                conn.close()
+
+            append_jsonl(
+                query_log,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "kind": "original",
+                    "path": path,
+                    "collection": collection,
+                },
+            )
+            body = asset.read_bytes()
+            self._send(
+                200, ctype, body,
+                extra={
+                    # inline so the browser can render it in the reader;
+                    # nosniff (already sent) keeps the declared type binding.
+                    "Content-Disposition": f'inline; filename="{asset.name}"',
+                    "Cache-Control": "no-cache",
                 },
             )
 
@@ -547,6 +668,10 @@ def make_handler(
                 total = conn.execute(
                     "SELECT COUNT(*) n FROM chunks WHERE doc_id = ?", (doc["id"],)
                 ).fetchone()["n"]
+                has_root = conn.execute(
+                    "SELECT 1 FROM meta WHERE key = ?",
+                    (f"corpus_root:{doc['collection']}",),
+                ).fetchone() is not None
                 # `start` pages absolutely; `seq` centres the window on a
                 # cited chunk. Mixing the two silently skipped chunks when
                 # paging backward, so `start` wins when both are present.
@@ -581,8 +706,11 @@ def make_handler(
                 {
                     "path": doc["path"],
                     "title": doc["title"],
+                    "label": readable_label(doc["title"], doc["path"]),
                     "filetype": doc["filetype"],
                     "collection": doc["collection"],
+                    "viewable": is_viewable(doc["path"]),
+                    "has_original": has_root,
                     "total_chunks": total,
                     "start": start,
                     "chunks": [
@@ -856,7 +984,8 @@ def _available_reports(reports_dir: Path | None) -> list[str]:
     )
 
 
-def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | None) -> None:
+def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | None,
+          fixtures_dir: str | Path | None = None) -> None:
     db_file = Path(db_path)
     writes_enabled = host in LOOPBACK_HOSTS
     if writes_enabled and not db_file.exists():
@@ -867,7 +996,8 @@ def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | N
     probe: sqlite3.Connection = db.connect_ro(db_file)
     probe.close()
     handler = make_handler(
-        db_file, Path(reports_dir) if reports_dir else None, writes_enabled, host
+        db_file, Path(reports_dir) if reports_dir else None, writes_enabled, host,
+        fixtures_dir=Path(fixtures_dir) if fixtures_dir else None,
     )
 
     class _Server(ThreadingHTTPServer):

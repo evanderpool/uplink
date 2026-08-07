@@ -41,6 +41,9 @@ class El {
   addEventListener(ev, fn) { (this._on[ev] = this._on[ev] || []).push(fn); }
   click() { (this._on.click || []).forEach((f) => f()); }
   scrollIntoView() {}
+  setAttribute(k, v) { this[k] = v; }
+  removeAttribute(k) { delete this[k]; }
+  focus() {}
   querySelector() { return null; }
   querySelectorAll() { return []; }
   find(pred) {
@@ -75,6 +78,9 @@ const openDoc = (path, collection, seq) => { OPENED = {call:"openDoc", path, col
 const openDocAt = (path, collection, start, citedSeq) =>
   { OPENED = {call:"openDocAt", path, collection, start, citedSeq}; };
 const openReader = () => {};
+let TAB = null;
+const showTab = (which) => { TAB = which; };
+const mountOriginal = () => {};
 const scrollThread = () => {};
 const postJSON = async () => ({ ok: true });
 const loadNotes = () => {};
@@ -105,7 +111,8 @@ def _extract(name: str) -> str:
     return APP_JS[start:end + 1]
 
 
-def _run(script: str, functions=("citationList", "renderAnswer", "renderDoc", "renderSnippet")) -> dict:
+def _run(script: str, functions=("citationList", "renderAnswer", "citedPage",
+                                 "renderDoc", "renderSnippet")) -> dict:
     body = "\n".join([DOM_SHIM] + [_extract(f) for f in functions] + [script])
     proc = subprocess.run(
         [NODE, "-e", body], capture_output=True, text=True, timeout=60,
@@ -379,3 +386,47 @@ def test_snippet_highlights_between_control_markers():
     """))
     assert out["marks"] == ["install guide"]
     assert "[docs](a.md)" in out["text"]
+
+
+# ------------------------- pins for the original-file reader
+
+def test_pdf_citation_resolves_the_cited_page():
+    """PDF sections are labelled 'Page 31' — enough to open the original at
+    the cited page rather than at page one."""
+    out = _run(textwrap.dedent("""
+        const doc = {chunks: [{seq: 4, section: "Page 12"}, {seq: 5, section: "Page 31"}]};
+        console.log(JSON.stringify({
+          cited: citedPage(doc, 5),
+          other: citedPage(doc, 4),
+          none: citedPage(doc, null),
+          missing: citedPage({chunks: [{seq: 1, section: "Overview"}]}, 1),
+        }));
+    """), functions=("citedPage",))
+    assert out == {"cited": 31, "other": 12, "none": None, "missing": None}
+
+
+def test_pdf_opens_on_the_original_tab_text_stays_on_passages():
+    out = _run(textwrap.dedent("""
+        renderDoc({path: "a.pdf", filetype: "pdf", collection: "tech",
+                   has_original: true, viewable: true, total_chunks: 2, start: 0,
+                   chunks: [{seq: 0, section: "Page 1", text: "x"}]}, 0);
+        const forPdf = TAB;
+        renderDoc({path: "b.md", filetype: "md", collection: "ops",
+                   has_original: true, viewable: true, total_chunks: 1, start: 0,
+                   chunks: [{seq: 0, section: "Intro", text: "y"}]}, 0);
+        console.log(JSON.stringify({forPdf: forPdf, forText: TAB}));
+    """))
+    assert out == {"forPdf": "original", "forText": "text"}
+
+
+def test_reader_records_original_availability():
+    """An upload-only collection has no source folder — the Original tab
+    must know that rather than showing a broken frame."""
+    out = _run(textwrap.dedent("""
+        renderDoc({path: "a.md", collection: "notes", filetype: "md",
+                   has_original: false, viewable: true, total_chunks: 1, start: 0,
+                   chunks: [{seq: 0, text: "z"}]}, 0);
+        console.log(JSON.stringify(state.reader));
+    """))
+    assert out["hasOriginal"] is False
+    assert out["viewable"] is True

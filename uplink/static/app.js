@@ -18,6 +18,24 @@ const el = (tag, cls, text) => {
   return n;
 };
 
+/* -------------------------------------------------------------- formatting */
+
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return Math.round(b / 1024) + " KB";
+  return (b / (1024 * 1024)).toFixed(1) + " MB";
+}
+function fmtPct(x) {
+  return x === null || x === undefined ? "—" : Math.round(Number(x) * 100) + "%";
+}
+function fmtMs(x) {
+  return x === null || x === undefined ? "—" : Number(x).toFixed(1) + " ms";
+}
+function fmtWhen(ts) {
+  return String(ts || "").slice(0, 16).replace("T", " ");
+}
+
 /* ------------------------------------------------------------------ motion */
 
 const MOTION = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -162,17 +180,22 @@ async function loadSources() {
     row.appendChild(box);
 
     const body = el("div", "source-body");
-    const name = el("button", "source-name", src.title || src.path);
+    const name = el("button", "source-name", src.label || src.title || src.path);
     name.type = "button";
     name.title = "Open " + src.path;
     name.addEventListener("click", () => openDoc(src.path, src.collection, null));
     body.appendChild(name);
 
+    // The real filename stays visible under the readable label: the label
+    // is for finding it, the filename is for citing it.
+    body.appendChild(el("div", "source-file", src.filename || src.path));
+
     const sub = el("div", "source-sub");
-    sub.appendChild(el("span", "ftype", src.filetype || "doc"));
-    sub.appendChild(el("span", null, (src.chunks || 0) + " chunks"));
+    sub.appendChild(el("span", "ftype", (src.filetype || "doc").toUpperCase()));
+    sub.appendChild(el("span", null, fmtBytes(src.size)));
+    sub.appendChild(el("span", null, (src.chunks || 0) + " passages"));
     if (!state.collection && src.collection) {
-      sub.appendChild(el("span", null, src.collection));
+      sub.appendChild(el("span", "tag-mini", src.collection));
     }
     body.appendChild(sub);
     row.appendChild(body);
@@ -254,6 +277,66 @@ function renderSuggestions(list) {
        { opacity: 0, y: 12, scale: 0.94, duration: 0.4, stagger: 0.05, ease: "back.out(1.6)" });
 }
 
+/* --------------------------------------------------------- chat history */
+
+// The thread survives a reload. Stored locally in this browser (never sent
+// anywhere) and capped, so a long working session cannot fill the quota.
+const HISTORY_KEY = "uplink-thread-v1";
+const HISTORY_MAX = 40;
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const rows = raw ? JSON.parse(raw) : [];
+    return Array.isArray(rows) ? rows.slice(-HISTORY_MAX) : [];
+  } catch (e) { return []; }
+}
+
+function saveHistory(rows) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(rows.slice(-HISTORY_MAX)));
+  } catch (e) { /* quota or private mode: history is a convenience, not state */ }
+}
+
+function recordTurn(entry) {
+  const rows = loadHistory();
+  rows.push(entry);
+  saveHistory(rows);
+}
+
+function restoreHistory() {
+  const rows = loadHistory();
+  if (!rows.length) return;
+  rows.forEach((row) => {
+    if (!row || typeof row !== "object" || !row.q) return;
+    const turn = addTurn(String(row.q), true);
+    const card = el("div", "card");
+    turn.appendChild(card);
+    if (row.kind === "answer" && row.answer) {
+      renderAnswer(card, { answer: row.answer, citations: row.citations }, String(row.q));
+    } else if (row.kind === "search" && Array.isArray(row.hits)) {
+      renderHits(card, { hits: row.hits, latency_ms: row.latency_ms || 0 }, String(row.q));
+    } else {
+      card.appendChild(el("p", "micro", "(result not stored)"));
+    }
+  });
+  $("thread").appendChild(historyDivider());
+  scrollThread();
+}
+
+function historyDivider() {
+  const d = el("div", "divider");
+  d.appendChild(el("span", null, "earlier in this session"));
+  return d;
+}
+
+function clearHistory() {
+  try { localStorage.removeItem(HISTORY_KEY); } catch (e) { /* ignore */ }
+  $("thread").querySelectorAll(".turn, .divider").forEach((n) => n.remove());
+  const empty = $("empty");
+  if (empty) empty.hidden = false;
+}
+
 /* -------------------------------------------------------------- the thread */
 
 function clearEmptyState() {
@@ -265,7 +348,7 @@ function clearEmptyState() {
   if (empty) empty.hidden = true;
 }
 
-function addTurn(question) {
+function addTurn(question, restoring) {
   clearEmptyState();
   const turn = el("div", "turn");
   turn.appendChild(el("div", "bubble-q", question));
@@ -439,6 +522,16 @@ async function runSearch() {
         (state.selected.size < state.sources.length ? " — or re-select sources." : ".")));
     } else {
       renderHits(card, data, q);
+      recordTurn({
+        kind: "search", q: q, ts: Date.now(),
+        latency_ms: data.latency_ms,
+        // Keep the thread light: the citation coordinates are what make a
+        // restored turn still clickable.
+        hits: data.hits.slice(0, 8).map((h) => ({
+          path: h.path, section: h.section, seq: h.seq,
+          collection: h.collection, score: h.score, snippet: h.snippet,
+        })),
+      });
     }
   } catch (e) {
     card.replaceChildren(el("p", "err", "search failed — is the server running?"));
@@ -472,7 +565,11 @@ async function askAI() {
       try { st = await api("/api/ask/" + started.id); } catch (e) { return; }
       if (st.state === "answered") {
         clearInterval(state.pollTimer); state.pollTimer = null;
-        try { renderAnswer(card, st, q); } finally { $("ai").disabled = false; }
+        try {
+          renderAnswer(card, st, q);
+          recordTurn({ kind: "answer", q: q, ts: Date.now(),
+                       answer: st.answer, citations: st.citations });
+        } finally { $("ai").disabled = false; }
       } else if (st.state === "error") {
         clearInterval(state.pollTimer); state.pollTimer = null;
         card.replaceChildren(el("p", "err", "brain error: " + String(st.error || "unknown")));
@@ -495,6 +592,7 @@ async function askAI() {
 
 $("composer").addEventListener("submit", (ev) => { ev.preventDefault(); runSearch(); });
 $("ai").addEventListener("click", askAI);
+$("clear-thread").addEventListener("click", clearHistory);
 
 /* ------------------------------------------------------------ source reader */
 
@@ -517,6 +615,8 @@ function closeReader() {
   if (back && typeof back.focus === "function") back.focus();
 }
 $("reader-close").addEventListener("click", closeReader);
+$("tab-original").addEventListener("click", () => showTab("original"));
+$("tab-text").addEventListener("click", () => showTab("text"));
 $("scrim").addEventListener("click", closeReader);
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && !$("reader").hidden) closeReader();
@@ -552,6 +652,54 @@ function openDocAt(path, collection, start, citedSeq) {
   return fetchDoc(path, collection, "&start=" + encodeURIComponent(start), citedSeq);
 }
 
+function citedPage(doc, citedSeq) {
+  // PDF sections are labelled "Page 31" — enough to open the original at
+  // the cited page rather than at page one.
+  if (!Number.isInteger(citedSeq)) return null;
+  const chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
+  const hit = chunks.find((c) => c && Number(c.seq) === Number(citedSeq));
+  const m = hit && /page\s*(\d+)/i.exec(String(hit.section || ""));
+  return m ? Number(m[1]) : null;
+}
+
+function showTab(which) {
+  const original = which === "original";
+  $("reader-frame-wrap").hidden = !original;
+  $("reader-body").hidden = original;
+  $("reader-nav").hidden = original;
+  $("tab-original").className = "tab" + (original ? " is-on" : "");
+  $("tab-text").className = "tab" + (original ? "" : " is-on");
+  if (original && state.reader) mountOriginal();
+}
+
+function mountOriginal() {
+  const r = state.reader;
+  if (!r) return;
+  const frame = $("reader-frame");
+  const note = $("reader-frame-note");
+  if (!r.hasOriginal) {
+    frame.removeAttribute("src");
+    note.textContent =
+      "This collection has no source folder on disk (uploaded documents), " +
+      "so the original file cannot be shown. The indexed text is complete.";
+    return;
+  }
+  let src = "/api/file?collection=" + encodeURIComponent(r.collection) +
+            "&path=" + encodeURIComponent(r.path);
+  if (r.viewable) {
+    if (r.page) src += "#page=" + r.page;
+    frame.src = src;
+    note.textContent = r.page
+      ? "Original file, opened at page " + r.page + "."
+      : "Original file as stored on disk.";
+  } else {
+    frame.removeAttribute("src");
+    note.textContent =
+      "Browsers cannot display this file type inline — use Download to open " +
+      "it in its own application. The indexed text tab shows its contents.";
+  }
+}
+
 function renderDoc(doc, citedSeq) {
   const total = Number(doc.total_chunks) || 0;
   const start = Number(doc.start) || 0;
@@ -560,11 +708,25 @@ function renderDoc(doc, citedSeq) {
   state.reader = {
     path: doc.path, collection: doc.collection,
     citedSeq: citedSeq, start: start, shown: chunks.length, total: total,
+    viewable: !!doc.viewable, hasOriginal: !!doc.has_original,
+    page: citedPage(doc, citedSeq),
   };
 
-  $("reader-path").textContent = String(doc.path || "");
+  $("reader-path").textContent = String(doc.label || doc.path || "");
   $("reader-meta").textContent =
-    "source text from the index · " + String(doc.collection || "") + " · " + total + " chunks";
+    String(doc.path || "") + " · " + String(doc.collection || "") +
+    " · " + total + " passages";
+
+  const dl = $("reader-download");
+  if (doc.has_original) {
+    dl.hidden = false;
+    dl.href = "/api/file?collection=" + encodeURIComponent(doc.collection) +
+              "&path=" + encodeURIComponent(doc.path);
+  } else {
+    dl.hidden = true;
+    dl.removeAttribute("href");
+  }
+  $("tab-original").disabled = !doc.has_original;
 
   const body = $("reader-body");
   body.replaceChildren();
@@ -585,6 +747,11 @@ function renderDoc(doc, citedSeq) {
   $("reader-prev").disabled = start <= 0;
   $("reader-next").disabled = start + chunks.length >= total;
 
+  // A PDF is much more readable as itself; text-shaped files read fine as
+  // indexed passages and keep the cited highlight.
+  showTab(doc.has_original && doc.viewable && doc.filetype === "pdf"
+          ? "original" : "text");
+
   const anchor = body.querySelector(".chunk.cited");
   if (anchor) anchor.scrollIntoView({ block: "center" });
   anim(body.querySelectorAll(".chunk"),
@@ -601,6 +768,129 @@ $("reader-next").addEventListener("click", () => {
   if (!r) return;
   openDocAt(r.path, r.collection, r.start + r.shown, r.citedSeq);
 });
+
+/* ----------------------------------------------------------------- metrics */
+
+// A sparkline built from SVG DOM nodes — no library, no innerHTML.
+function sparkline(values, width, height) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.setAttribute("class", "spark-svg");
+  svg.setAttribute("aria-hidden", "true");
+  const nums = (values || []).map(Number).filter((n) => !Number.isNaN(n));
+  if (nums.length < 2) return svg;
+  const lo = Math.min(...nums), hi = Math.max(...nums);
+  const span = hi - lo || 1;
+  const step = width / (nums.length - 1);
+  const pts = nums.map((v, i) =>
+    [i * step, height - ((v - lo) / span) * (height - 4) - 2]);
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  path.setAttribute("points", pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "));
+  path.setAttribute("class", "spark-line");
+  svg.appendChild(path);
+  const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  dot.setAttribute("cx", pts[pts.length - 1][0].toFixed(1));
+  dot.setAttribute("cy", pts[pts.length - 1][1].toFixed(1));
+  dot.setAttribute("r", "2.6");
+  dot.setAttribute("class", "spark-dot");
+  svg.appendChild(dot);
+  return svg;
+}
+
+function metricRow(label, value, tone) {
+  const row = el("div", "mrow");
+  row.appendChild(el("span", "mrow-l", label));
+  row.appendChild(el("span", "mrow-v" + (tone ? " " + tone : ""), value));
+  return row;
+}
+
+async function loadMetrics() {
+  const m = await api("/api/metrics");
+  if (m.error) return;
+
+  // ---- accuracy: the honest one. Missing means missing.
+  const acc = $("accuracy");
+  acc.replaceChildren();
+  if (!m.accuracy || !m.accuracy.available) {
+    acc.appendChild(el("p", "micro",
+      "No eval runs logged yet. Run `uplink eval fixtures/golden.jsonl --log` " +
+      "to record a measured baseline."));
+  } else {
+    const a = m.accuracy;
+    const big = el("div", "metric-hero");
+    big.appendChild(el("span", "metric-hero-n", fmtPct(a.hit_at_1)));
+    big.appendChild(el("span", "metric-hero-l", "hit@1"));
+    acc.appendChild(big);
+    acc.appendChild(metricRow("hit@" + a.k, fmtPct(a.hit_at_k)));
+    acc.appendChild(metricRow("MRR", Number(a.mrr).toFixed(3)));
+    acc.appendChild(metricRow("questions", String(a.questions)));
+    if (a.series && a.series.length > 1) {
+      const wrap = el("div", "spark-wrap");
+      wrap.appendChild(sparkline(a.series.map((s) => s.mrr), 200, 30));
+      wrap.appendChild(el("span", "micro", "MRR over " + a.runs + " logged runs"));
+      acc.appendChild(wrap);
+    }
+    acc.appendChild(el("p", "micro",
+      (a.label || "unlabeled run") + " · " + fmtWhen(a.ts) +
+      (a.fixtures ? " · " + a.fixtures : "")));
+  }
+
+  // ---- performance
+  const perf = $("performance");
+  perf.replaceChildren();
+  const p = m.performance || {};
+  perf.appendChild(metricRow("median latency", fmtMs(p.median_ms), "good"));
+  perf.appendChild(metricRow("p95 latency", fmtMs(p.p95_ms)));
+  perf.appendChild(metricRow("searches logged", String(p.searches || 0)));
+  perf.appendChild(metricRow("sources opened", String(p.source_opens || 0)));
+  perf.appendChild(metricRow("zero-hit rate", fmtPct(p.zero_hit_rate),
+                             (p.zero_hit_rate || 0) > 0.25 ? "warn" : ""));
+  if (p.recent && p.recent.length > 1) {
+    const wrap = el("div", "spark-wrap");
+    wrap.appendChild(sparkline(p.recent.map((r) => r.latency_ms), 200, 26));
+    wrap.appendChild(el("span", "micro", "latency, last " + p.recent.length + " searches"));
+    perf.appendChild(wrap);
+  }
+
+  // ---- human feedback loop
+  const fb = $("feedback-metrics");
+  fb.replaceChildren();
+  const f = m.feedback || {};
+  if (!f.total) {
+    fb.appendChild(el("p", "micro",
+      "No votes yet. Rate a result 👍/👎 — upvotes become eval fixtures via " +
+      "`uplink promote`, which is how the system improves itself."));
+  } else {
+    fb.appendChild(metricRow("helpful", String(f.up), "good"));
+    fb.appendChild(metricRow("off-target", String(f.down), f.down ? "warn" : ""));
+    fb.appendChild(metricRow("helpful rate", fmtPct(f.helpful_rate)));
+    fb.appendChild(metricRow("promoted to fixtures", String(f.promoted_fixtures)));
+    if (f.pending_promotion) {
+      fb.appendChild(metricRow("awaiting promotion", String(f.pending_promotion), "warn"));
+    }
+    (f.by_document || []).forEach((d) => {
+      const row = el("div", "mrow mrow-sub");
+      row.appendChild(el("span", "mrow-l", d.path));
+      row.appendChild(el("span", "mrow-v", "+" + d.up + " / -" + d.down));
+      fb.appendChild(row);
+    });
+  }
+
+  // ---- corpus health
+  const h = $("health-metrics");
+  h.replaceChildren();
+  const hh = m.health || {};
+  h.appendChild(metricRow("corpus size", fmtBytes(hh.bytes)));
+  h.appendChild(metricRow("avg passages/doc", String(hh.avg_chunks_per_doc || 0)));
+  if (hh.documents_without_chunks) {
+    h.appendChild(metricRow("unsearchable docs",
+                            String(hh.documents_without_chunks), "warn"));
+  }
+  (hh.by_type || []).forEach((r) => {
+    h.appendChild(metricRow("." + r.filetype, String(r.docs) + " docs"));
+  });
+  h.appendChild(el("p", "micro", "last indexed " + (hh.last_indexed || "never")));
+}
 
 /* ------------------------------------------------------------------- notes */
 
@@ -693,6 +983,7 @@ $("upgo").addEventListener("click", async () => {
       $("file").value = "";
       await loadStatus();
       await loadSources();
+      await loadMetrics();
     }
   } catch (e) {
     $("upmsg").textContent = "upload failed";
@@ -747,6 +1038,8 @@ async function boot() {
   await loadStatus();
   await loadSources();
   await loadNotes();
+  await loadMetrics();
+  restoreHistory();
 }
 
 boot();
