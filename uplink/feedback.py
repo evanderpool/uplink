@@ -22,10 +22,14 @@ VALID_VOTES = ("up", "down")
 
 
 def append_jsonl(path: Path, obj: dict) -> None:
-    """Append one JSON line, creating parent folders on first use."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, ensure_ascii=True) + "\n")
+    """Append one JSON line, creating parent folders on first use.
+
+    Heals a torn tail first: a crash mid-write leaves a line with no
+    newline, and appending onto it would fuse the two records and lose both.
+    """
+    from .notes import append_line
+
+    append_line(path, json.dumps(obj, ensure_ascii=True))
 
 
 def _norm(q: str) -> str:

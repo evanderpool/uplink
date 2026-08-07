@@ -73,13 +73,26 @@ def search(
     k: int = 8,
     max_text: int = 1200,
     collection: str | None = None,
+    include: list[tuple[str, str]] | None = None,
+    exclude: list[tuple[str, str]] | None = None,
 ) -> list[Hit]:
-    """Search the index; `collection=None` searches every collection."""
+    """Search the index.
+
+    `collection=None` searches every collection.
+
+    `include` / `exclude` are lists of (collection, path) pairs — documents
+    are identified by BOTH, because the schema keys them on
+    UNIQUE(collection, path) and the same filename legitimately exists in
+    several collections. The source checkboxes in the web UI are these
+    parameters, so deselecting a source genuinely removes it from retrieval.
+    An empty `include` list means "no sources selected" and honestly
+    retrieves nothing; `include=None` means "not scoping at all".
+    """
     conn = db.connect_ro(db_path)
     try:
-        rows = _run(conn, build_match(query, "and"), k, collection)
+        rows = _run(conn, build_match(query, "and"), k, collection, include, exclude)
         if not rows:
-            rows = _run(conn, build_match(query, "or"), k, collection)
+            rows = _run(conn, build_match(query, "or"), k, collection, include, exclude)
         hits = []
         for row in rows:
             text = row["text"]
@@ -101,7 +114,20 @@ def search(
         conn.close()
 
 
-def _run(conn: sqlite3.Connection, match: str | None, k: int, collection: str | None):
+def _pairs_clause(pairs: list[tuple[str, str]]) -> str:
+    """`(d.collection, d.path) IN (VALUES (?,?), …)` — row values, so a
+    document is matched by its real composite identity."""
+    return "(d.collection, d.path) IN (VALUES " + ",".join(["(?,?)"] * len(pairs)) + ")"
+
+
+def _run(
+    conn: sqlite3.Connection,
+    match: str | None,
+    k: int,
+    collection: str | None,
+    include: list[tuple[str, str]] | None = None,
+    exclude: list[tuple[str, str]] | None = None,
+):
     if not match:
         return []
     where = "chunks_fts MATCH ?"
@@ -109,6 +135,16 @@ def _run(conn: sqlite3.Connection, match: str | None, k: int, collection: str | 
     if collection is not None:
         where += " AND d.collection = ?"
         params.append(collection)
+    if include is not None:
+        if not include:
+            return []  # every source deselected: retrieve nothing, honestly
+        where += " AND " + _pairs_clause(include)
+        for coll, path in include:
+            params.extend([coll, path])
+    if exclude:
+        where += " AND NOT " + _pairs_clause(exclude)
+        for coll, path in exclude:
+            params.extend([coll, path])
     params.append(k)
     return conn.execute(
         f"""

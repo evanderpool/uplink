@@ -1,15 +1,29 @@
-"""Uplink web UI — a local retrieval explorer with localhost-gated writes.
+"""Uplink web UI — a three-panel workspace with localhost-gated writes.
 
-`python -m uplink serve` starts a stdlib-only HTTP server (no frameworks, no
-JavaScript dependencies):
+`python -m uplink serve` starts a stdlib-only HTTP server. The server has no
+framework and no build step; the interface lives in `uplink/static/`
+(index.html, app.css, app.js) plus one vendored animation library (GSAP —
+see static/NOTICE.md). Nothing is fetched from a network at runtime, which
+is what keeps the offline and privacy guarantees literal.
 
-    GET  /                     the Ask page (search box + cited results)
-    GET  /api/search?q=&k=&collection=   search results as JSON (read-only)
+    GET  /                     the workspace (Sources / Conversation / Studio)
+    GET  /static/<asset>       bundled UI assets (whitelisted names only)
+    GET  /api/sources?collection=        documents + opening questions
+    GET  /api/search?q=&k=&collection=&path=…   results as JSON (read-only)
     GET  /api/status           index statistics as JSON
     GET  /api/doc?path=&collection=&seq=&start=&limit=   source text (read-only)
+    GET  /api/notes?collection=          saved notes
+    GET  /api/ask/<id>         poll a queued question
     GET  /reports/<kind>.html  generated reports, if present
     POST /api/upload           add a document to a collection   (localhost only)
     POST /api/feedback         thumbs up/down on a result       (localhost only)
+    POST /api/ask              queue a question for the brain   (localhost only)
+    POST /api/notes            save an answer                   (localhost only)
+    POST /api/notes/delete     tombstone a note                 (localhost only)
+
+Repeated `path=` parameters on /api/search narrow retrieval to those
+documents — the source checkboxes are that parameter, so deselecting a
+source genuinely removes it from retrieval rather than hiding its results.
 
 Security posture:
 - binds to 127.0.0.1 unless --host says otherwise (Tailscale exposure is a
@@ -59,12 +73,25 @@ from urllib.parse import parse_qs, urlparse
 from . import asks, db
 from .extractors import SUPPORTED_EXTENSIONS
 from .feedback import VALID_VOTES, append_jsonl
+from .notes import add_note, delete_note, list_notes
 from .search import hits_to_dicts, search
+from .suggest import suggestions
 
 MAX_QUERY_LEN = 500
 MAX_K = 25
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_FEEDBACK_BYTES = 10 * 1024
+MAX_NOTE_BYTES = 64 * 1024
+MAX_SOURCE_FILTER = 200
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+# Whitelist, not a directory listing: these are the only files servable.
+STATIC_FILES = {
+    "index.html": "text/html; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+    "gsap.min.js": "text/javascript; charset=utf-8",
+}
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
@@ -88,6 +115,27 @@ def _int_param(params: dict, name: str, default: int | None) -> int | None:
     if not -_INT64_MAX <= value <= _INT64_MAX:
         return default
     return value
+
+
+def _doc_pairs(raw: list[str] | None) -> list[tuple[str, str]]:
+    """Parse repeated `doc=<collection>/<path>` values into identity pairs.
+
+    A document's identity is (collection, path) — the schema keys them that
+    way, and the same filename legitimately exists in several collections.
+    Collection slugs never contain '/', so the first slash is an unambiguous
+    separator. Malformed values are dropped rather than widening the filter.
+    """
+    out: list[tuple[str, str]] = []
+    for value in raw or []:
+        coll, sep, path = value.partition("/")
+        if not sep or not path.strip():
+            continue
+        try:
+            db.validate_collection(coll)
+        except ValueError:
+            continue
+        out.append((coll, path.strip()))
+    return out
 
 
 def sanitize_filename(raw: str) -> str:
@@ -161,6 +209,7 @@ def make_handler(
     query_log = data_dir / "query-log.jsonl"
     feedback_log = data_dir / "feedback.jsonl"
     asks_dir = data_dir / "asks"
+    notes_path = data_dir / "notes.jsonl"
     allowed_hosts = {bind_host.lower(), "127.0.0.1", "localhost", "::1", "[::1]"}
     # Serializes browser uploads: index_folder holds a write transaction for
     # its whole run, so without this a second simultaneous upload waits out
@@ -199,7 +248,13 @@ def make_handler(
             url = urlparse(self.path)
             try:
                 if url.path == "/":
-                    self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+                    self._static("index.html")
+                elif url.path.startswith("/static/"):
+                    self._static(url.path.removeprefix("/static/"))
+                elif url.path == "/api/sources":
+                    self._api_sources(url)
+                elif url.path == "/api/notes":
+                    self._api_notes(url)
                 elif url.path == "/api/search":
                     self._api_search(url)
                 elif url.path == "/api/status":
@@ -255,6 +310,10 @@ def make_handler(
                     self._api_feedback()
                 elif url.path == "/api/ask":
                     self._api_ask()
+                elif url.path == "/api/notes":
+                    self._api_note_add()
+                elif url.path == "/api/notes/delete":
+                    self._api_note_delete()
                 else:
                     self._drain()
                     self._send(404, "text/plain; charset=utf-8", b"not found")
@@ -288,8 +347,31 @@ def make_handler(
             if not query:
                 self._json(400, {"error": "missing q parameter"})
                 return
+            # Source checkboxes. `scoped=1` says a selection is in force —
+            # without it an empty selection would be indistinguishable from
+            # "no scoping" and would silently search the whole corpus, the
+            # exact inverse of what the interface promises.
+            scoped = bool(params.get("scoped"))
+            exclude = _doc_pairs(params.get("xdoc"))
+            # Exclusion mode ("everything except these") is not an empty
+            # selection: only a scoped request with no exclusions and no
+            # inclusions means "nothing is selected".
+            include = None if exclude else (_doc_pairs(params.get("doc")) if scoped else None)
+            if include is not None and len(include) > MAX_SOURCE_FILTER:
+                raise ValueError(
+                    f"too many sources selected ({len(include)}); "
+                    f"the limit is {MAX_SOURCE_FILTER}"
+                )
+            if len(exclude) > MAX_SOURCE_FILTER:
+                raise ValueError(
+                    f"too many sources excluded ({len(exclude)}); "
+                    f"the limit is {MAX_SOURCE_FILTER}"
+                )
             t0 = time.perf_counter()
-            hits = search(db_path, query, k=k, collection=collection)
+            hits = search(
+                db_path, query, k=k, collection=collection,
+                include=include, exclude=exclude or None,
+            )
             latency_ms = round((time.perf_counter() - t0) * 1000, 1)
             append_jsonl(
                 query_log,
@@ -349,6 +431,63 @@ def make_handler(
                 self._send(404, "text/plain; charset=utf-8", b"report not generated yet")
                 return
             self._send(200, "text/html; charset=utf-8", page.read_bytes())
+
+        def _static(self, name: str) -> None:
+            """Serve a bundled asset. Whitelisted by name — the static dir is
+            application code, not user content, and must never become a
+            file-read surface."""
+            ctype = STATIC_FILES.get(name)
+            if ctype is None:
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+                return
+            asset = STATIC_DIR / name
+            if not asset.is_file():
+                self._send(404, "text/plain; charset=utf-8", b"asset missing")
+                return
+            self._send(200, ctype, asset.read_bytes())
+
+        def _api_sources(self, url) -> None:
+            """The documents in a collection, plus opening questions — what
+            the Sources panel and the empty state are built from."""
+            params = parse_qs(url.query)
+            collection = (params.get("collection") or [""])[0].strip() or None
+            if collection is not None:
+                collection = db.validate_collection(collection)
+            conn = db.connect_ro(db_path)
+            try:
+                where, args = "", []
+                if collection:
+                    where, args = "WHERE d.collection = ?", [collection]
+                rows = conn.execute(
+                    f"""
+                    SELECT d.path, d.title, d.filetype, d.collection, d.size,
+                           d.indexed_at, COUNT(c.id) chunks
+                    FROM documents d LEFT JOIN chunks c ON c.doc_id = d.id
+                    {where}
+                    GROUP BY d.id ORDER BY d.collection, d.path
+                    """,
+                    args,
+                ).fetchall()
+                collections = db.list_collections(conn)
+                prompts = suggestions(conn, collection)
+            finally:
+                conn.close()
+            self._json(
+                200,
+                {
+                    "collection": collection,
+                    "collections": collections,
+                    "sources": [dict(r) for r in rows],
+                    "suggestions": prompts,
+                },
+            )
+
+        def _api_notes(self, url) -> None:
+            params = parse_qs(url.query)
+            collection = (params.get("collection") or [""])[0].strip() or None
+            if collection is not None:
+                collection = db.validate_collection(collection)
+            self._json(200, {"notes": list_notes(notes_path, collection)})
 
         def _api_doc(self, url) -> None:
             """Serve a window of one document's chunks so a citation can be
@@ -587,6 +726,42 @@ def make_handler(
                 },
             )
 
+        def _json_body(self, cap: int) -> dict:
+            body = self._read_body(cap)
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("expected a JSON body") from None
+            if not isinstance(payload, dict):
+                raise ValueError("expected a JSON object")
+            return payload
+
+        def _api_note_add(self) -> None:
+            payload = self._json_body(MAX_NOTE_BYTES)
+            body = str(payload.get("body") or "").strip()
+            if not body:
+                raise ValueError("a note needs a body")
+            collection = payload.get("collection")
+            if collection:
+                collection = db.validate_collection(str(collection))
+            note = add_note(
+                notes_path,
+                title=str(payload.get("title") or "")[:300],
+                body=body,
+                citations=payload.get("citations"),
+                collection=collection or None,
+                kind=str(payload.get("kind") or "answer"),
+            )
+            self._json(200, {"note": note})
+
+        def _api_note_delete(self) -> None:
+            payload = self._json_body(MAX_FEEDBACK_BYTES)
+            note_id = str(payload.get("id") or "")
+            if not delete_note(notes_path, note_id):
+                self._json(404, {"error": "no such note"})
+                return
+            self._json(200, {"deleted": note_id})
+
         def _api_feedback(self) -> None:
             body = self._read_body(MAX_FEEDBACK_BYTES)
             try:
@@ -705,560 +880,3 @@ def serve(db_path: str | Path, host: str, port: int, reports_dir: str | Path | N
         httpd.server_close()
 
 
-# ---------------------------------------------------------------------------
-# The page. One file, inline CSS/JS, same design tokens as the reports.
-# Corpus-derived strings are ALWAYS rendered via textContent.
-# Write controls (upload, thumbs) render only when /api/status says writes
-# are enabled — and the server refuses the POSTs regardless of the UI.
-# ---------------------------------------------------------------------------
-
-PAGE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Uplink</title>
-<style>
-:root { color-scheme: light dark; }
-body {
-  margin: 0; padding: 0 20px 64px;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  background: var(--page); color: var(--ink);
-  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
-  --muted: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
-  --accent: #2a78d6; --accent-ink: #ffffff; --good: #2e7d4f; --bad: #b3402a;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) body {
-    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
-    --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
-    --accent: #3987e5; --accent-ink: #ffffff; --good: #58b384; --bad: #e0765f;
-  }
-}
-main { max-width: 720px; margin: 0 auto; }
-header { padding: 28px 0 4px; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-h1 { font-size: 20px; margin: 0; letter-spacing: 0.2px; }
-.tag { color: var(--muted); font-size: 12px; }
-nav { margin-left: auto; display: flex; gap: 14px; }
-nav a { color: var(--ink-2); font-size: 12.5px; text-decoration: none; border-bottom: 1px solid var(--grid); padding-bottom: 1px; }
-nav a:hover { color: var(--ink); border-color: var(--ink-2); }
-#statusline { color: var(--muted); font-size: 12px; margin: 2px 0 22px; min-height: 15px; }
-form#f { display: flex; gap: 8px; }
-#q {
-  flex: 1; font: inherit; font-size: 15px; color: var(--ink);
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 12px 14px; outline: none; min-width: 0;
-}
-#q:focus { border-color: var(--accent); }
-select {
-  font: inherit; font-size: 13px; color: var(--ink);
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 0 10px; max-width: 160px;
-}
-button {
-  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
-  background: var(--accent); color: var(--accent-ink);
-  border: none; border-radius: 10px; padding: 0 18px;
-}
-button:disabled { opacity: 0.6; cursor: default; }
-#meta { color: var(--muted); font-size: 12px; margin: 14px 2px 6px; min-height: 15px; }
-.hit {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 12px 16px 14px; margin: 10px 0;
-}
-.cite { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.path { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
-.coll { color: var(--accent); font-size: 11px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
-.section { color: var(--ink-2); font-size: 12.5px; }
-.score { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.snippet { color: var(--ink-2); font-size: 13px; line-height: 1.5; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.fb { display: flex; gap: 6px; margin-top: 8px; }
-.fb button {
-  background: none; border: 1px solid var(--border); color: var(--muted);
-  border-radius: 8px; font-size: 12px; padding: 3px 10px; font-weight: 500;
-}
-.fb button:hover { color: var(--ink); border-color: var(--ink-2); }
-.fb button.done-up { color: var(--good); border-color: var(--good); }
-.fb button.done-down { color: var(--bad); border-color: var(--bad); }
-.empty { color: var(--muted); font-size: 13px; padding: 24px 4px; }
-mark { background: none; color: var(--ink); font-weight: 650; }
-#answer { margin: 10px 0; }
-.ans {
-  background: var(--surface); border: 1px solid var(--accent);
-  border-radius: 10px; padding: 14px 16px;
-}
-.ans-label { color: var(--accent); font-size: 11px; font-weight: 700;
-  letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px; }
-.ans-text { font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
-.ans-cites { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-.ans-cites button { color: var(--ink-2); font-size: 11.5px; border: 1px solid var(--border);
-  border-radius: 999px; padding: 2px 9px; overflow-wrap: anywhere; background: none;
-  font-weight: 500; text-align: left; cursor: pointer; }
-.ans-cites button:hover { color: var(--ink); border-color: var(--accent); }
-.path.link { cursor: pointer; text-decoration: underline; text-decoration-style: dotted;
-  text-underline-offset: 3px; }
-.path.link:hover { color: var(--accent); }
-#viewer { margin: 12px 0; }
-.doc {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 14px 16px 16px;
-}
-.doc-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
-  border-bottom: 1px solid var(--grid); padding-bottom: 8px; margin-bottom: 10px; }
-.doc-title { font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
-.doc-meta { color: var(--muted); font-size: 11.5px; }
-.doc-close { margin-left: auto; background: none; border: 1px solid var(--border);
-  color: var(--ink-2); border-radius: 8px; font-size: 12px; padding: 2px 10px; font-weight: 500; }
-.chunk { border-left: 2px solid var(--grid); padding: 2px 0 2px 12px; margin: 12px 0; }
-.chunk.cited { border-left-color: var(--accent); }
-.chunk-head { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
-  margin-bottom: 4px; }
-.chunk-text { font-size: 12.5px; line-height: 1.55; white-space: pre-wrap;
-  overflow-wrap: anywhere; color: var(--ink-2); }
-.chunk.cited .chunk-text { color: var(--ink); }
-.doc-nav { display: flex; gap: 8px; align-items: center; margin-top: 12px;
-  border-top: 1px solid var(--grid); padding-top: 10px; }
-.doc-nav button { background: none; border: 1px solid var(--border); color: var(--ink-2);
-  border-radius: 8px; font-size: 12px; padding: 3px 12px; font-weight: 500; }
-.doc-nav button:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-2); }
-.doc-nav span { color: var(--muted); font-size: 11.5px; }
-.ans-wait { color: var(--muted); font-size: 12.5px; padding: 10px 2px; }
-button.secondary { background: none; color: var(--accent); border: 1px solid var(--accent); }
-details#up { margin-top: 28px; }
-details#up summary { color: var(--ink-2); font-size: 13px; cursor: pointer; }
-#upform { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
-#upform input[type=file] { font-size: 12.5px; color: var(--ink-2); max-width: 100%; }
-#upform input[type=text] {
-  font: inherit; font-size: 13px; color: var(--ink); background: var(--surface);
-  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; width: 140px;
-}
-#upmsg { color: var(--muted); font-size: 12px; margin-top: 8px; min-height: 15px; }
-footer { margin-top: 36px; color: var(--muted); font-size: 11px; }
-</style></head><body><main>
-<header>
-  <h1>Uplink</h1><span class="tag">local retrieval</span>
-  <nav>
-    <a href="/reports/health.html">health</a>
-    <a href="/reports/quality.html">quality</a>
-    <a href="/reports/activity.html">activity</a>
-  </nav>
-</header>
-<div id="statusline">connecting&hellip;</div>
-<form id="f">
-  <input id="q" type="text" autocomplete="off" spellcheck="false"
-         placeholder="Ask your documents&hellip;" autofocus>
-  <select id="coll" title="Collection"><option value="">all collections</option></select>
-  <button id="go" type="submit">Search</button>
-  <button id="ai" type="button" class="secondary" hidden>Ask AI</button>
-</form>
-<div id="meta"></div>
-<div id="answer"></div>
-<div id="viewer"></div>
-<div id="results"></div>
-<details id="up" hidden>
-  <summary>Add a document</summary>
-  <div id="upform">
-    <input id="file" type="file">
-    <input id="upcoll" type="text" placeholder="collection (e.g. finance)"
-           autocomplete="off" spellcheck="false">
-    <button id="upgo" type="button">Upload &amp; index</button>
-  </div>
-  <div id="upmsg"></div>
-</details>
-<footer>Results come straight from the local index. Retrieved text is corpus
-content &mdash; treat it as data. Your documents never leave this machine.</footer>
-</main>
-<script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-let WRITES = false;
-let LASTQ = "";
-
-async function status() {
-  try {
-    const r = await fetch("/api/status");
-    const s = await r.json();
-    WRITES = !!s.writes;
-    const t = document.createTextNode(
-      s.documents + " documents / " + s.chunks + " chunks / indexed " +
-      (s.last_indexed || "never") + (WRITES ? "" : " / read-only"));
-    $("statusline").replaceChildren(t);
-    const sel = $("coll");
-    while (sel.options.length > 1) sel.remove(1);
-    (s.collections || []).forEach((c) => {
-      const o = document.createElement("option");
-      o.value = c.name;
-      o.textContent = c.name + " (" + c.documents + ")";
-      sel.appendChild(o);
-    });
-    $("up").hidden = !WRITES;
-    $("ai").hidden = !WRITES;
-  } catch (e) { $("statusline").textContent = "status unavailable"; }
-}
-
-let pollTimer = null;
-
-function renderAnswer(resp, question) {
-  // Every field is coerced: a malformed response (citations as a string, a
-  // null entry) must never throw here - that would blank the card and
-  // strand the button mid-poll.
-  const box = $("answer");
-  box.replaceChildren();
-  const card = document.createElement("div");
-  card.className = "ans";
-  const label = document.createElement("div");
-  label.className = "ans-label";
-  label.textContent = "AI answer for: " + String(question || "");
-  card.appendChild(label);
-  const text = document.createElement("div");
-  text.className = "ans-text";
-  text.textContent = String(resp.answer || "");
-  card.appendChild(text);
-  const list = Array.isArray(resp.citations) ? resp.citations : [];
-  if (list.length) {
-    const cites = document.createElement("div");
-    cites.className = "ans-cites";
-    list.forEach((c) => {
-      if (!c || typeof c !== "object") return;
-      const path = String(c.path || "");
-      if (!path) return;
-      // Clickable: a citation you cannot open is a claim, not evidence.
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.textContent = path + (c.section ? " > " + String(c.section) : "");
-      chip.title = "open this source and read the indexed text";
-      const seq = Number.isInteger(c.seq) ? c.seq : null;
-      chip.addEventListener("click", () => openDoc(path, c.collection || null, seq));
-      cites.appendChild(chip);
-    });
-    if (cites.childNodes.length) card.appendChild(cites);
-  }
-  box.appendChild(card);
-}
-
-function clearAnswer() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  $("answer").replaceChildren();
-  $("viewer").replaceChildren();
-  $("ai").disabled = false;
-}
-
-async function askAI() {
-  const q = $("q").value.trim();
-  if (!q) return;
-  LASTQ = q;
-  clearAnswer();
-  $("ai").disabled = true;
-  const box = $("answer");
-  const wait = document.createElement("div");
-  wait.className = "ans-wait";
-  wait.textContent = "queued - waiting for the brain session\\u2026";
-  box.appendChild(wait);
-  try {
-    const r = await fetch("/api/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Uplink": "1" },
-      body: JSON.stringify({ q: q, collection: $("coll").value || null }),
-    });
-    const data = await r.json();
-    if (data.error) { wait.textContent = "error: " + data.error; $("ai").disabled = false; return; }
-    const started = Date.now();
-    pollTimer = setInterval(async () => {
-      const elapsed = Math.round((Date.now() - started) / 1000);
-      try {
-        const pr = await fetch("/api/ask/" + data.id);
-        const st = await pr.json();
-        if (st.state === "answered") {
-          clearInterval(pollTimer); pollTimer = null;
-          try { renderAnswer(st, q); } finally { $("ai").disabled = false; }
-        } else if (st.state === "error") {
-          clearInterval(pollTimer); pollTimer = null;
-          wait.textContent = "brain error: " + String(st.error || "unknown");
-          $("ai").disabled = false;
-        } else if (elapsed > 180) {
-          clearInterval(pollTimer); pollTimer = null;
-          wait.textContent = "no answer after 3 minutes - is the brain session running with its watcher armed?";
-          $("ai").disabled = false;
-        } else {
-          wait.textContent = "waiting for the brain session\\u2026 " + elapsed + "s";
-        }
-      } catch (e) { /* transient poll failure - keep polling */ }
-    }, 2000);
-  } catch (e) {
-    wait.textContent = "ask failed - is the server still running?";
-    $("ai").disabled = false;
-  }
-}
-
-$("ai").addEventListener("click", askAI);
-
-// --- source viewer: open any citation and read what retrieval actually saw ---
-
-function closeViewer() { $("viewer").replaceChildren(); }
-
-function renderDoc(doc, citedSeq) {
-  // Every value is coerced and inserted as text; document content never
-  // becomes markup here any more than it does in a search result.
-  const box = $("viewer");
-  box.replaceChildren();
-  const card = document.createElement("div");
-  card.className = "doc";
-
-  const head = document.createElement("div");
-  head.className = "doc-head";
-  const title = document.createElement("span");
-  title.className = "doc-title";
-  title.textContent = String(doc.path || "");
-  head.appendChild(title);
-  const meta = document.createElement("span");
-  meta.className = "doc-meta";
-  const total = Number(doc.total_chunks) || 0;
-  meta.textContent = "source text from the index \\u00B7 " +
-    String(doc.collection || "") + " \\u00B7 " + total + " chunks";
-  head.appendChild(meta);
-  const close = document.createElement("button");
-  close.className = "doc-close";
-  close.textContent = "close";
-  close.addEventListener("click", closeViewer);
-  head.appendChild(close);
-  card.appendChild(head);
-
-  const chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
-  chunks.forEach((c) => {
-    if (!c || typeof c !== "object") return;
-    const div = document.createElement("div");
-    // Number.isInteger, not ==: Number(null) is 0, which would mark chunk
-    // #0 as "the cited passage" whenever a citation carries no seq.
-    const isCited = Number.isInteger(citedSeq) && Number(c.seq) === Number(citedSeq);
-    div.className = "chunk" + (isCited ? " cited" : "");
-    const h = document.createElement("div");
-    h.className = "chunk-head";
-    h.textContent = "#" + String(c.seq) + (c.section ? " \\u00B7 " + String(c.section) : "");
-    div.appendChild(h);
-    const t = document.createElement("div");
-    t.className = "chunk-text";
-    t.textContent = String(c.text || "");
-    div.appendChild(t);
-    card.appendChild(div);
-  });
-
-  const start = Number(doc.start) || 0;
-  const shown = chunks.length;
-  const nav = document.createElement("div");
-  nav.className = "doc-nav";
-  // Paging uses an ABSOLUTE start, never a seq to re-centre on: centring
-  // shifts the window by limit/2 as well, which silently skipped chunks
-  // every time the reader stepped backward.
-  const prev = document.createElement("button");
-  prev.textContent = "\\u2190 earlier";
-  prev.disabled = start <= 0;
-  prev.addEventListener("click", () =>
-    openDocAt(doc.path, doc.collection, Math.max(0, start - shown), citedSeq));
-  const next = document.createElement("button");
-  next.textContent = "later \\u2192";
-  next.disabled = start + shown >= total;
-  next.addEventListener("click", () =>
-    openDocAt(doc.path, doc.collection, start + shown, citedSeq));
-  const pos = document.createElement("span");
-  pos.textContent = shown
-    ? "showing " + (start + 1) + "\\u2013" + (start + shown) + " of " + total
-    : "no text";
-  nav.appendChild(prev);
-  nav.appendChild(next);
-  nav.appendChild(pos);
-  card.appendChild(nav);
-
-  box.appendChild(card);
-  card.scrollIntoView({ block: "nearest" });
-}
-
-async function fetchDoc(path, collection, params, citedSeq) {
-  const box = $("viewer");
-  box.replaceChildren();
-  const wait = document.createElement("div");
-  wait.className = "ans-wait";
-  wait.textContent = "opening " + String(path) + "\\u2026";
-  box.appendChild(wait);
-  let url = "/api/doc?path=" + encodeURIComponent(path);
-  if (collection) url += "&collection=" + encodeURIComponent(collection);
-  url += params;
-  try {
-    const r = await fetch(url);
-    const doc = await r.json();
-    if (doc.error) {
-      let msg = "cannot open: " + String(doc.error);
-      if (Array.isArray(doc.collections) && doc.collections.length) {
-        msg += " (" + doc.collections.map(String).join(", ") + ")";
-      }
-      wait.textContent = msg;
-      return;
-    }
-    renderDoc(doc, citedSeq);
-  } catch (e) {
-    wait.textContent = "could not load the source document";
-  }
-}
-
-// Open centred on a cited chunk.
-function openDoc(path, collection, seq) {
-  const anchored = Number.isInteger(seq);
-  return fetchDoc(path, collection,
-    anchored ? "&seq=" + encodeURIComponent(seq) : "",
-    anchored ? seq : null);
-}
-
-// Page to an absolute offset, keeping whatever chunk was cited highlighted.
-function openDocAt(path, collection, start, citedSeq) {
-  return fetchDoc(path, collection, "&start=" + encodeURIComponent(start), citedSeq);
-}
-
-function renderSnippet(el, snippet) {
-  // The API marks matches with non-printable \\u0001/\\u0002 delimiters (so
-  // corpus text containing [ ] renders intact); matched spans become bold
-  // via DOM nodes only - corpus text itself never becomes HTML.
-  const parts = snippet.split(/[\\u0001\\u0002]/);
-  parts.forEach((part, i) => {
-    if (!part) return;
-    if (i % 2 === 1) {
-      const m = document.createElement("mark");
-      m.textContent = part;
-      el.appendChild(m);
-    } else {
-      el.appendChild(document.createTextNode(part));
-    }
-  });
-}
-
-async function sendFeedback(h, vote, btn, other) {
-  try {
-    const r = await fetch("/api/feedback", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Uplink": "1" },
-      body: JSON.stringify({
-        q: LASTQ, path: h.path, seq: h.seq, vote: vote, collection: h.collection,
-      }),
-    });
-    if (r.ok) {
-      btn.className = "done-" + vote;
-      other.className = "";
-    }
-  } catch (e) { /* feedback is best-effort */ }
-}
-
-function renderHit(h) {
-  const card = document.createElement("div");
-  card.className = "hit";
-  const cite = document.createElement("div");
-  cite.className = "cite";
-  const path = document.createElement("span");
-  path.className = "path link";
-  path.textContent = h.path;
-  path.title = "open this document at this passage";
-  path.addEventListener("click", () => openDoc(h.path, h.collection, h.seq));
-  cite.appendChild(path);
-  if (h.collection) {
-    const c = document.createElement("span");
-    c.className = "coll";
-    c.textContent = h.collection;
-    cite.appendChild(c);
-  }
-  if (h.section) {
-    const sec = document.createElement("span");
-    sec.className = "section";
-    sec.textContent = "> " + h.section;
-    cite.appendChild(sec);
-  }
-  const score = document.createElement("span");
-  score.className = "score";
-  score.textContent = h.score.toFixed(2);
-  cite.appendChild(score);
-  card.appendChild(cite);
-  const snip = document.createElement("div");
-  snip.className = "snippet";
-  renderSnippet(snip, h.snippet);
-  card.appendChild(snip);
-  if (WRITES) {
-    const fb = document.createElement("div");
-    fb.className = "fb";
-    const upB = document.createElement("button");
-    upB.textContent = "\\uD83D\\uDC4D helpful";
-    const downB = document.createElement("button");
-    downB.textContent = "\\uD83D\\uDC4E off-target";
-    upB.addEventListener("click", () => sendFeedback(h, "up", upB, downB));
-    downB.addEventListener("click", () => sendFeedback(h, "down", downB, upB));
-    fb.appendChild(upB);
-    fb.appendChild(downB);
-    card.appendChild(fb);
-  }
-  return card;
-}
-
-$("f").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const q = $("q").value.trim();
-  if (!q) return;
-  LASTQ = q;
-  // A new search retires any AI answer (and cancels an in-flight one):
-  // a cited answer must never sit above the results of a different question.
-  clearAnswer();
-  $("go").disabled = true;
-  $("meta").textContent = "searching\\u2026";
-  try {
-    let url = "/api/search?q=" + encodeURIComponent(q) + "&k=8";
-    const coll = $("coll").value;
-    if (coll) url += "&collection=" + encodeURIComponent(coll);
-    const r = await fetch(url);
-    const data = await r.json();
-    const results = $("results");
-    results.replaceChildren();
-    if (data.error) {
-      $("meta").textContent = "error: " + data.error;
-    } else if (!data.hits.length) {
-      $("meta").textContent = "no results (" + data.latency_ms + " ms)";
-      const d = document.createElement("div");
-      d.className = "empty";
-      d.textContent = "Nothing matched. Try fewer or different words.";
-      results.appendChild(d);
-    } else {
-      $("meta").textContent = data.hits.length + " results for \\u201C" + q +
-        "\\u201D \\u00B7 " + data.latency_ms + " ms";
-      data.hits.forEach((h) => results.appendChild(renderHit(h)));
-    }
-  } catch (e) {
-    $("meta").textContent = "search failed - is the server still running?";
-  } finally {
-    $("go").disabled = false;
-  }
-});
-
-$("upgo").addEventListener("click", async () => {
-  const f = $("file").files[0];
-  if (!f) { $("upmsg").textContent = "choose a file first"; return; }
-  const fd = new FormData();
-  fd.append("collection", $("upcoll").value.trim() || "main");
-  fd.append("file", f);
-  $("upgo").disabled = true;
-  $("upmsg").textContent = "uploading\\u2026";
-  try {
-    const r = await fetch("/api/upload", {
-      method: "POST", headers: { "X-Uplink": "1" }, body: fd,
-    });
-    const data = await r.json();
-    if (data.error) {
-      $("upmsg").textContent = "error: " + data.error;
-    } else {
-      $("upmsg").textContent = "indexed " + data.saved + " into '" +
-        data.collection + "' (" + data.chunks + " chunks)";
-      $("file").value = "";
-      status();
-    }
-  } catch (e) {
-    $("upmsg").textContent = "upload failed";
-  } finally {
-    $("upgo").disabled = false;
-  }
-});
-
-status();
-</script>
-</body></html>
-"""

@@ -168,9 +168,9 @@ def append_history(
         "k": summary["k"],
         "mrr": summary["mrr"],
     }
-    history.parent.mkdir(parents=True, exist_ok=True)
-    with history.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    from .notes import append_line
+
+    append_line(history, json.dumps(entry, ensure_ascii=True))
 
 
 def load_history(history: Path) -> list[dict]:

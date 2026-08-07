@@ -94,7 +94,32 @@ def test_index_page_serves(server):
     status, body = _get(server + "/")
     assert status == 200
     assert b"Uplink" in body
-    assert b"textContent" in body  # the no-innerHTML rendering contract
+    assert b"panel-sources" in body and b"panel-studio" in body  # the workspace shell
+
+
+def test_static_assets_serve_with_correct_types(server):
+    for name, ctype in (
+        ("app.css", "text/css"),
+        ("app.js", "text/javascript"),
+        ("gsap.min.js", "text/javascript"),
+    ):
+        with urllib.request.urlopen(server + "/static/" + name, timeout=10) as resp:
+            assert resp.status == 200
+            assert ctype in resp.headers["Content-Type"]
+            assert int(resp.headers["Content-Length"]) > 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../webapp.py", "..%2Fwebapp.py", "secrets.env", "index.html/../db.py", "NOTICE.md"],
+)
+def test_static_is_a_whitelist_not_a_directory(server, name: str):
+    """The static dir is application code, not a file-read surface."""
+    try:
+        code, _ = _get(server + "/static/" + name)
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+    assert code == 404, name
 
 
 def test_api_search_returns_cited_hits(server):

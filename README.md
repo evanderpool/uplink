@@ -68,6 +68,13 @@ AI operating system.
   to a future vector store).
 - `uplink/asks.py` — the ask queue: file-pair request/response handoff to
   whatever LLM session is acting as the brain.
+- `uplink/notes.py` — saved notes (append-only JSONL with tombstones) and
+  the shared torn-tail-safe line writer every log uses.
+- `uplink/suggest.py` — opening questions derived deterministically from
+  the index, so the empty state can never propose a topic the corpus
+  does not contain.
+- `uplink/static/` — the workspace UI: index.html, app.css, app.js, and
+  one vendored animation library (see NOTICE.md). No build step.
 
 ## Install
 
@@ -115,11 +122,30 @@ be fetched with `python scripts/fetch_corpora.py` and indexed as `finance` /
 `health` / `tech` collections — `fixtures/industry-golden.jsonl` scores
 retrieval over them.
 
-## Web UI
+## The workspace
 
-`python -m uplink serve` starts a stdlib-only local web app: a search box
-over your corpus with cited results (`path > section`), a collection picker,
-match highlighting, per-query latency, and links to the generated reports.
+`python -m uplink serve` opens a three-panel workspace at `localhost:8180`:
+
+- **Sources** — every document in the collection with its chunk count. The
+  checkboxes are not a display filter: deselecting a source removes it from
+  retrieval, and deselecting all of them honestly returns nothing.
+- **Conversation** — a thread of questions with their results. Search
+  returns cited passages instantly; **Ask AI** returns a written answer.
+  The empty state offers opening questions derived from the index itself,
+  so a new corpus is never a blank box.
+- **Studio** — index statistics, generated reports, and saved notes. Saving
+  an answer keeps its citations clickable.
+
+Click any citation, source name, or result path to open the **source
+reader**: the indexed text, centred on the cited chunk, pageable through the
+document.
+
+The interface is served from `uplink/static/` — plain HTML, CSS, and
+JavaScript with no build step and no framework. One library is vendored
+(GSAP, for motion; see `uplink/static/NOTICE.md`) rather than loaded from a
+CDN, because a CDN request would put a network call into a product whose
+guarantee is that nothing leaves the machine. Motion degrades to none if it
+fails to load, and respects `prefers-reduced-motion`.
 
 **The localhost-only write rule:** upload and thumbs-feedback endpoints exist
 only while the server is bound to a loopback address (the default). Bound to
@@ -252,7 +278,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (169 tests) covers every extractor (including a byte-level
+The suite (205 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on
@@ -267,8 +293,12 @@ queue (id validation, malformed-response handling, cap-under-concurrency,
 watcher dedup, and the answer-card render contract executed as real
 JavaScript in a DOM shim), and the source viewer (index-only reads,
 ambiguous-path refusal, gapless paging across a whole document, int64
-overflow, audit logging) — every finding from the adversarial reviews is
-pinned by a regression test.
+overflow, audit logging), and the workspace (per-source scoping by
+composite (collection, path) identity, the empty-selection guarantee
+asserted over HTTP rather than one layer below it, static-asset
+whitelisting, torn-tail-safe logs, and the render contracts executed as
+real JavaScript) — every finding from the adversarial reviews is pinned
+by a regression test.
 
 ## License
 
