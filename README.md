@@ -117,10 +117,21 @@ the client privacy boundary a filesystem boundary rather than a WHERE clause.
 Each collection is bound to one source folder; indexing a different folder
 into it is refused rather than silently purging its documents.
 
-Public-domain test corpora (SEC 10-Ks, CDC guidelines, NIST publications) can
-be fetched with `python scripts/fetch_corpora.py` and indexed as `finance` /
-`health` / `tech` collections — `fixtures/industry-golden.jsonl` scores
-retrieval over them.
+Public-domain test corpora can be fetched with
+`python scripts/fetch_corpora.py` and indexed as `finance` / `health` /
+`tech` collections. Each industry mixes narrative documents with tabular
+data, so retrieval is exercised across both extraction paths:
+
+| Collection | Narrative | Tabular |
+|---|---|---|
+| finance | SEC 10-Ks (Apple, Microsoft, Tesla) | BLS employment tables (.xlsx) |
+| health | CDC infection-control guidelines | BLS injury/illness rates (.xlsx), CDC provisional deaths (.csv) |
+| tech | NIST security publications | CISA known-exploited vulnerabilities (.csv) |
+
+`fixtures/industry-golden.jsonl` scores retrieval over all of them.
+SEC and BLS require a contact address in the User-Agent — pass
+`--contact you@example.com` (and `--org`), or those files are skipped
+rather than fetched under a fake identity.
 
 ## The workspace
 
@@ -251,11 +262,13 @@ The two remaining misses are vocabulary-mismatch questions (the question's
 words don't appear in the answering document) — the documented motivation for
 phase 2.
 
-On the public-domain industry corpora (10 documents, 4,661 chunks — SEC
-10-Ks, CDC infection-control guidelines, NIST security publications;
-`fixtures/industry-golden.jsonl`, 13 questions): **hit@1 92% / hit@5 92% /
-MRR 0.923**, one vocabulary-mismatch miss. Reproducible with
-`scripts/fetch_corpora.py` + three `index --collection` commands.
+On the public-domain industry corpora (15 documents, 6,062 chunks across
+PDF, HTML-derived text, Excel and CSV; `fixtures/industry-golden.jsonl`,
+19 questions): **hit@1 95% / hit@5 95% / MRR 0.947**, one
+vocabulary-mismatch miss. Adding 1,401 spreadsheet and CSV passages left
+the original 13 questions unchanged and all six new tabular questions
+answer at rank 1. Reproducible with `scripts/fetch_corpora.py` + three
+`index --collection` commands.
 
 ## Reports
 

@@ -46,6 +46,13 @@ CORPORA: dict[str, list[tuple[str, str]]] = {
          "microsoft-10k-fy2023.txt"),
         ("https://www.sec.gov/Archives/edgar/data/1318605/000162828024002390/tsla-20231231.htm",
          "tesla-10k-fy2023.txt"),
+        # Spreadsheets: the same corpus in tabular form, which exercises a
+        # different extraction path (openpyxl -> header-preserving chunks)
+        # and lets a question span narrative and numbers.
+        ("https://www.bls.gov/cps/cpsaat18.xlsx",
+         "bls-employed-by-industry-occupation.xlsx"),
+        ("https://www.bls.gov/cps/cpsaat01.xlsx",
+         "bls-employment-status-civilian-population.xlsx"),
     ],
     "health": [
         # CDC infection-control guidelines.
@@ -55,6 +62,11 @@ CORPORA: dict[str, list[tuple[str, str]]] = {
          "cdc-disinfection-sterilization.pdf"),
         ("https://www.cdc.gov/infectioncontrol/pdf/guidelines/environmental-guidelines-P.pdf",
          "cdc-environmental-infection-control.pdf"),
+        ("https://www.bls.gov/iif/nonfatal-injuries-and-illnesses-tables/"
+         "table-1-injury-and-illness-rates-by-industry-2022-national.xlsx",
+         "bls-injury-illness-rates-by-industry-2022.xlsx"),
+        ("https://data.cdc.gov/api/views/489q-934x/rows.csv?accessType=DOWNLOAD",
+         "cdc-provisional-covid-deaths-by-week.csv"),
     ],
     "tech": [
         # NIST security publications.
@@ -66,10 +78,16 @@ CORPORA: dict[str, list[tuple[str, str]]] = {
          "nist-sp-800-171r2-protecting-cui.pdf"),
         ("https://nvlpubs.nist.gov/nistpubs/CSWP/NIST.CSWP.04162018.pdf",
          "nist-cybersecurity-framework-1-1.pdf"),
+        # CISA's catalog of vulnerabilities known to be exploited in the
+        # wild — the tabular counterpart to the NIST guidance above.
+        ("https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv",
+         "cisa-known-exploited-vulnerabilities.csv"),
     ],
 }
 
-_NEEDS_CONTACT = ("sec.gov",)
+# Hosts whose bot filters reject a User-Agent containing a URL and want a
+# plain "Org contact@example.com" instead.
+_NEEDS_CONTACT = ("sec.gov", "bls.gov")
 
 
 class _HTMLToText(HTMLParser):

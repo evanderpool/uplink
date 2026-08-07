@@ -13,3 +13,9 @@
 {"q": "What are the requirements for protecting controlled unclassified information in nonfederal systems?", "expect": ["nist-sp-800-171"]}
 {"q": "Which security control families does NIST define?", "expect": ["nist-sp-800-53", "nist-sp-800-171"]}
 {"q": "What are the five core functions of the cybersecurity framework?", "expect": ["nist-cybersecurity-framework"]}
+{"q": "How many people are employed by detailed industry in thousands?", "expect": ["bls-employed-by-industry"]}
+{"q": "What is the employment status of the civilian noninstitutional population?", "expect": ["bls-employment-status"]}
+{"q": "What are the incidence rates of nonfatal occupational injuries and illnesses by industry?", "expect": ["bls-injury-illness"]}
+{"q": "Which vulnerabilities are known to be used in ransomware campaigns?", "expect": ["cisa-known-exploited"]}
+{"q": "What is the required action and due date for a known exploited vulnerability?", "expect": ["cisa-known-exploited"]}
+{"q": "How many provisional COVID-19 deaths were reported by week?", "expect": ["cdc-provisional-covid-deaths"]}
