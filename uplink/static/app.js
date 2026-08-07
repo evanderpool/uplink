@@ -469,7 +469,7 @@ function renderAnswer(card, resp, question) {
       collection: state.collection || null,
     });
     save.textContent = out.error ? "could not save" : "Saved ✓";
-    if (!out.error) { save.classList.add("on-good"); loadNotes(); loadMetrics(); }
+    if (!out.error) { save.classList.add("on-good"); loadNotes(); scheduleMetrics(); }
   });
   actions.appendChild(save);
 
@@ -493,7 +493,7 @@ function renderAnswer(card, resp, question) {
         if (!out.error) {
           btn.className = "mini " + (verdict === "up" ? "on-good" : "on-bad");
           other.className = "mini";
-          loadMetrics();
+          scheduleMetrics();
         }
       };
       up.addEventListener("click", () => rate("up", up, down));
@@ -570,7 +570,7 @@ async function vote(hit, verdict, btn, other, question) {
     btn.className = "mini " + (verdict === "up" ? "on-good" : "on-bad");
     other.className = "mini";
     anim(btn, { scale: 0.82, duration: 0.3, ease: "back.out(3)" });
-    loadMetrics();
+    scheduleMetrics();
   }
 }
 
@@ -612,6 +612,7 @@ async function runSearch() {
   } finally {
     $("go").disabled = false;
     $("q").value = "";
+    scheduleMetrics();
   }
 }
 
@@ -648,7 +649,7 @@ async function askAI() {
           renderAnswer(card, st, q);
           recordTurn({ kind: "answer", q: q, ts: Date.now(),
                        answer: st.answer, citations: st.citations });
-        } finally { $("ai").disabled = false; }
+        } finally { $("ai").disabled = false; scheduleMetrics(); }
       } else if (st.state === "error") {
         clearInterval(state.pollTimer); state.pollTimer = null;
         card.replaceChildren(el("p", "err", "brain error: " + String(st.error || "unknown")));
@@ -722,6 +723,7 @@ async function fetchDoc(path, collection, params, citedSeq) {
     return;
   }
   renderDoc(doc, citedSeq);
+  scheduleMetrics();
 }
 
 function openDoc(path, collection, seq) {
@@ -1006,6 +1008,16 @@ function fmtDelta(n, asPoints) {
   return (v > 0 ? "+" : "") + shown;
 }
 
+let metricsTimer = null;
+
+// Every action that moves a number schedules a refresh; the debounce means
+// a burst of searches costs one re-score rather than one each.
+function scheduleMetrics(delay) {
+  if (metricsTimer) clearTimeout(metricsTimer);
+  metricsTimer = setTimeout(() => { metricsTimer = null; loadMetrics(); },
+                            delay === undefined ? 900 : delay);
+}
+
 async function loadMetrics() {
   const m = await api("/api/metrics");
   if (m.error) return;
@@ -1187,7 +1199,7 @@ function promoteFixtures(btn) {
     btn.textContent = out.added
       ? "promoted " + out.added
       : "nothing new to promote";
-    loadMetrics();
+    scheduleMetrics();
   });
 }
 

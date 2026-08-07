@@ -560,3 +560,28 @@ def test_failing_questions_are_listed_by_name():
     assert "MISS" in out["text"]
     assert "when is hand hygiene required" in out["text"]
     assert "rank 3" in out["text"]
+
+
+# ------------------------- pins for live metric refreshing
+
+def test_metrics_refresh_after_every_action_that_moves_them():
+    """Numbers that go stale the moment you use the app are worse than no
+    numbers: search, answers, and source opens all change what the panel
+    reports, so each must schedule a refresh."""
+    for fn, why in (
+        ("runSearch", "latency, zero-hit rate, search count"),
+        ("askAI", "answers, time-to-answer, citations per answer"),
+        ("fetchDoc", "source opens and verification rate"),
+    ):
+        assert "scheduleMetrics()" in _extract(fn), f"{fn} must refresh: {why}"
+
+
+def test_metrics_refresh_is_debounced_and_not_self_scheduling():
+    """/api/metrics re-scores the live index, so a burst of actions must
+    collapse to one refresh — and the timer must call loadMetrics, never
+    itself, or it re-arms forever."""
+    src = _extract("scheduleMetrics")
+    assert "clearTimeout" in src, "a burst must collapse to one refresh"
+    assert "loadMetrics()" in src
+    body = src[src.index("setTimeout"):]
+    assert "scheduleMetrics(" not in body, "the timer must not re-schedule itself"

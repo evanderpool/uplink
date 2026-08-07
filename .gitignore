@@ -16,3 +16,12 @@ reports/
 
 # Fetched test corpora - re-download with scripts/fetch_corpora.py.
 corpora/
+
+# Apple product manuals fetched for local indexing — Apple's copyright,
+# personal use only, never redistributed. (corpora/ already covers this;
+# stated explicitly so the intent survives a future .gitignore edit.)
+corpora/apple-products/
+
+# Fixtures scoring a PRIVATE corpus stay local: they reference documents
+# nobody else has, and naming them publicly serves no one.
+fixtures/local-*.jsonl
