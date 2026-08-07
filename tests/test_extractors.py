@@ -63,6 +63,15 @@ def test_xlsx_sheets_as_rows(corpus: Path):
     assert result.sections[0].title == "Sheet: Budget"
 
 
+def test_xls_legacy_binary_rows(corpus: Path):
+    result = extract(corpus / "vendors.xls")
+    text = _all_text(result)
+    assert "acme telecom" in text
+    assert "2027" in text and "2027.0" not in text  # integer floats rendered clean
+    assert result.sections[0].title.startswith("Sheet:")
+    assert result.sections[0].header.startswith("vendor")
+
+
 def test_unsupported_extension_raises(tmp_path: Path):
     weird = tmp_path / "photo.png"
     weird.write_bytes(b"not text")
@@ -71,5 +80,5 @@ def test_unsupported_extension_raises(tmp_path: Path):
 
 
 def test_supported_extensions_cover_requirements():
-    for ext in (".md", ".txt", ".pdf", ".docx", ".xlsx", ".csv", ".tsv"):
+    for ext in (".md", ".txt", ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".tsv"):
         assert ext in SUPPORTED_EXTENSIONS

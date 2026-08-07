@@ -1,12 +1,14 @@
 """Shared test fixtures: a small corpus with one file of every supported type.
 
-The PDF is assembled byte-by-byte (with a correct xref table) so the test
-suite has zero dependency on any PDF-writing library.
+The PDF is assembled byte-by-byte (with a correct xref table) and the legacy
+.xls is a hand-built BIFF2 stream, so the test suite has zero dependency on
+any PDF- or XLS-writing library.
 """
 
 from __future__ import annotations
 
 import csv
+import struct
 from pathlib import Path
 
 import pytest
@@ -44,9 +46,34 @@ def make_minimal_pdf(text: str) -> bytes:
     return header + body + xref + trailer
 
 
+def make_minimal_xls(rows: list[list[object]]) -> bytes:
+    """Build a tiny valid legacy Excel file: a raw BIFF2 worksheet stream.
+
+    Real-world .xls files wrap BIFF8 in an OLE2 container, but xlrd also
+    accepts a bare BIFF2 stream (Excel 2.x format), which is simple enough
+    to assemble by hand: BOF, CODEPAGE, one record per cell, EOF.
+    """
+
+    def record(opcode: int, data: bytes) -> bytes:
+        return struct.pack("<HH", opcode, len(data)) + data
+
+    out = record(0x0009, struct.pack("<HH", 0, 0x0010))  # BOF: BIFF2 worksheet
+    out += record(0x0042, struct.pack("<H", 1252))  # CODEPAGE: windows-1252
+    for r, cells in enumerate(rows):
+        for c, cell in enumerate(cells):
+            if isinstance(cell, (int, float)):
+                # NUMBER: row, col, 3 attribute bytes, IEEE double.
+                out += record(0x0003, struct.pack("<HH3sd", r, c, b"\x00\x00\x00", float(cell)))
+            else:
+                s = str(cell).encode("latin-1")
+                # LABEL: row, col, 3 attribute bytes, length-prefixed string.
+                out += record(0x0004, struct.pack("<HH3sB", r, c, b"\x00\x00\x00", len(s)) + s)
+    return out + record(0x000A, b"")  # EOF
+
+
 @pytest.fixture
 def corpus(tmp_path: Path) -> Path:
-    """A corpus folder with md, txt, csv, tsv, pdf, docx, and xlsx files."""
+    """A corpus folder with md, txt, csv, tsv, pdf, docx, xlsx, and xls files."""
     root = tmp_path / "corpus"
     root.mkdir()
 
@@ -100,6 +127,17 @@ def corpus(tmp_path: Path) -> Path:
     ws.append(["tailscale subscription", 0])
     ws.append(["backup drive", 129.99])
     wb.save(str(root / "budget.xlsx"))
+
+    pytest.importorskip("xlrd", reason="xlrd not installed")
+    (root / "vendors.xls").write_bytes(
+        make_minimal_xls(
+            [
+                ["vendor", "contract", "renewal year"],
+                ["acme telecom", "fiber uplink", 2027],
+                ["initech", "badge printers", 2026],
+            ]
+        )
+    )
 
     # Files that must be ignored.
     (root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n0000")

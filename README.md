@@ -30,7 +30,7 @@ AI operating system.
 ## Architecture
 
 ```
- documents (md, pdf, docx, xlsx, csv, tsv, txt)
+ documents (md, pdf, docx, xlsx, xls, csv, tsv, txt)
       |
       v
   extractors ──> chunker ──> SQLite (documents + chunks + FTS5)
@@ -86,6 +86,7 @@ pip install -e .            # core only - zero dependencies
 pip install -e ".[pdf]"     # + PDF (pypdf)
 pip install -e ".[docx]"    # + Word (python-docx)
 pip install -e ".[xlsx]"    # + Excel (openpyxl)
+pip install -e ".[xls]"     # + legacy Excel (xlrd)
 pip install -e ".[dev]"     # everything + pytest
 ```
 

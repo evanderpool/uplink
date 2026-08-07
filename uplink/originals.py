@@ -24,15 +24,18 @@ CONTENT_TYPES = {
     ".pdf": "application/pdf",
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/plain; charset=utf-8",
+    ".markdown": "text/plain; charset=utf-8",
     ".csv": "text/plain; charset=utf-8",
     ".tsv": "text/plain; charset=utf-8",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".xls": "application/vnd.ms-excel",
 }
 
 # Types a browser renders in place. Everything else is offered as a download
 # while the indexed-text view stays the readable option.
-VIEWABLE = {".pdf", ".txt", ".md", ".csv", ".tsv"}
+VIEWABLE = {".pdf", ".txt", ".md", ".markdown", ".csv", ".tsv"}
 
 MAX_FILE_BYTES = 80 * 1024 * 1024
 

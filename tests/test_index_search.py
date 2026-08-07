@@ -23,9 +23,9 @@ def indexed(corpus: Path, tmp_path: Path):
 
 def test_index_counts(indexed):
     _, _, stats = indexed
-    assert stats.indexed == 7  # md, txt, csv, tsv, pdf, docx, xlsx
+    assert stats.indexed == 8  # md, txt, csv, tsv, pdf, docx, xlsx, xls
     assert stats.errors == []
-    assert stats.chunks >= 7
+    assert stats.chunks >= 8
 
 
 def test_ignored_files_not_indexed(indexed):
@@ -47,6 +47,7 @@ def test_ignored_files_not_indexed(indexed):
         ("when does the migration freeze end", "briefing.pdf"),
         ("badge request approval", "procedure.docx"),
         ("tailscale subscription cost", "budget.xlsx"),
+        ("acme telecom contract renewal", "vendors.xls"),
     ],
 )
 def test_search_finds_every_file_type(indexed, query, expect_path):
@@ -62,7 +63,7 @@ def test_incremental_reindex_skips_unchanged(indexed):
     corpus, db_path, _ = indexed
     stats2 = index_folder(corpus, db_path)
     assert stats2.indexed == 0
-    assert stats2.unchanged == 7
+    assert stats2.unchanged == 8
 
 
 def test_changed_file_reindexed_and_old_chunks_gone(indexed):

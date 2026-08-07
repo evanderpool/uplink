@@ -340,3 +340,14 @@ def test_upload_label_falls_back_to_a_cleaned_filename(tmp_path: Path):
 
     assert code == 200
     assert data["label"] == "Mac Mini M1 2020 Quick Start Guide"
+
+
+def test_every_indexable_type_can_be_served_as_an_original():
+    """A document the indexer accepts but the reader refuses to display is a
+    dead end the interface offers and cannot honour — so the two lists must
+    not drift apart."""
+    from uplink.extractors import SUPPORTED_EXTENSIONS
+    from uplink.originals import CONTENT_TYPES
+
+    missing = sorted(set(SUPPORTED_EXTENSIONS) - set(CONTENT_TYPES))
+    assert not missing, f"indexable but not serveable: {missing}"

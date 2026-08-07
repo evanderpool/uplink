@@ -10,6 +10,7 @@ Supported today:
     .pdf                     pypdf        (optional dependency)
     .docx                    python-docx  (optional dependency)
     .xlsx / .xlsm            openpyxl     (optional dependency)
+    .xls                     xlrd         (optional dependency)
 
 Optional dependencies degrade gracefully: if the library is missing the file
 is skipped with a clear message instead of crashing the whole index run.
@@ -52,7 +53,7 @@ SUPPORTED_EXTENSIONS = {
     ".md", ".markdown", ".txt",
     ".csv", ".tsv",
     ".pdf", ".docx",
-    ".xlsx", ".xlsm",
+    ".xlsx", ".xlsm", ".xls",
 }
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -73,6 +74,8 @@ def extract(path: Path) -> Extracted:
         return _extract_docx(path)
     if ext in (".xlsx", ".xlsm"):
         return _extract_xlsx(path)
+    if ext == ".xls":
+        return _extract_xls(path)
     raise ValueError(f"Unsupported file type: {ext}")
 
 
@@ -265,6 +268,61 @@ def _extract_xlsx(path: Path) -> Extracted:
                 )
     finally:
         wb.close()
+
+    if not out.sections:
+        out.warnings.append("empty workbook")
+    return out
+
+
+def _extract_xls(path: Path) -> Extracted:
+    """Legacy binary Excel (BIFF). Same shape as _extract_xlsx, via xlrd."""
+    try:
+        import xlrd
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ExtractorUnavailable("xlrd not installed (pip install xlrd)") from exc
+
+    out = Extracted(title=path.stem)
+    try:
+        wb = xlrd.open_workbook(str(path))
+    except xlrd.XLRDError as exc:
+        # Encrypted or corrupt workbook: warn and move on, like encrypted PDFs.
+        out.warnings.append(f"unreadable .xls - skipped ({exc})")
+        return out
+    try:
+        for sheet in wb.sheets():
+            lines: list[str] = []
+            for r in range(sheet.nrows):
+                cells: list[str] = []
+                for c in range(sheet.ncols):
+                    cell = sheet.cell(r, c)
+                    value = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            value = xlrd.xldate_as_datetime(
+                                value, wb.datemode
+                            ).isoformat(sep=" ")
+                        except Exception:
+                            pass
+                    elif isinstance(value, float) and value.is_integer():
+                        # xlrd reads every number as float; drop the '.0' noise.
+                        value = int(value)
+                    cells.append(str(value).strip()[:MAX_CELL_CHARS])
+                line = " | ".join(cells).strip()
+                if not line.strip(" |"):
+                    continue
+                lines.append(line)
+                if len(lines) >= MAX_TABLE_ROWS:
+                    out.warnings.append(
+                        f"sheet '{sheet.name}' truncated at {MAX_TABLE_ROWS} rows"
+                    )
+                    break
+            if lines:
+                header = lines[0] if len(lines) > 1 else ""
+                out.sections.append(
+                    Section(title=f"Sheet: {sheet.name}", text="\n".join(lines), header=header)
+                )
+    finally:
+        wb.release_resources()
 
     if not out.sections:
         out.warnings.append("empty workbook")
