@@ -217,3 +217,45 @@ def test_unscoped_request_leaves_scope_absent(tmp_path: Path):
         httpd.shutdown()
         httpd.server_close()
     assert "docs" not in read_request(db_path.parent / "asks", ask_id)
+
+
+# ----------------------------------------------- stale-page detection
+
+def test_index_html_carries_a_build_stamp(tmp_path: Path):
+    """A tab runs the JS it loaded; without a stamp it cannot know it is
+    behind, which is exactly how a source selection silently failed to
+    travel while the UI looked current."""
+    import urllib.request
+
+    from test_webapp import _make_server
+    from uplink.webapp import build_id
+
+    httpd, url, _ = _make_server(tmp_path, writes_enabled=True)
+    try:
+        with urllib.request.urlopen(url + "/", timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+        with urllib.request.urlopen(url + "/api/status", timeout=10) as resp:
+            status = json.loads(resp.read())
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert "__BUILD__" not in body, "the placeholder must be substituted"
+    assert build_id() in body
+    assert status["build"] == build_id(), "page and server must be comparable"
+
+
+def test_build_id_changes_when_an_asset_changes(tmp_path: Path, monkeypatch):
+    import time as _time
+
+    from uplink import webapp
+
+    original = (webapp.STATIC_DIR / "app.js").read_bytes()
+    first = webapp.build_id()
+    try:
+        _time.sleep(0.01)
+        (webapp.STATIC_DIR / "app.js").write_bytes(original + b"\n// touch\n")
+        assert webapp.build_id() != first
+    finally:
+        (webapp.STATIC_DIR / "app.js").write_bytes(original)
+    assert webapp.build_id() != "" and webapp.build_id() is not None

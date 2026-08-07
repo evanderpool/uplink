@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Uplink</title>
+<meta name="uplink-build" content="__BUILD__">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -15,6 +16,13 @@
   <span class="orb orb-a"></span>
   <span class="orb orb-b"></span>
   <span class="orb orb-c"></span>
+</div>
+
+<div id="stale" class="stale-banner" hidden>
+  <span>This page is running an older version of Uplink. Reload to pick up
+  the current one — until you do, source selections and other controls may
+  not behave as shown.</span>
+  <button id="stale-reload" class="btn btn-primary" type="button">Reload</button>
 </div>
 
 <header class="topbar">
@@ -123,7 +131,8 @@
           <button id="go" class="btn btn-ghost" type="submit" title="Keyword search (instant)">
             Search
           </button>
-          <button id="ai" class="btn btn-primary" type="button" hidden
+          <span id="scope-hint" class="scope-hint" hidden></span>
+        <button id="ai" class="btn btn-primary" type="button" hidden
                   title="Generate a cited answer">
             <span class="btn-label">Ask AI</span>
           </button>

@@ -58,6 +58,7 @@ loopback, decide that corpus reads by anyone on that network are acceptable.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -86,6 +87,7 @@ MAX_NOTE_BYTES = 64 * 1024
 MAX_SOURCE_FILTER = 200
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
 # Whitelist, not a directory listing: these are the only files servable.
 STATIC_FILES = {
     "index.html": "text/html; charset=utf-8",
@@ -93,6 +95,34 @@ STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "gsap.min.js": "text/javascript; charset=utf-8",
 }
+
+_BUILD_CACHE: dict = {"key": None, "id": "dev"}
+
+
+def build_id() -> str:
+    """A short fingerprint of the served interface.
+
+    A browser tab keeps running whatever JavaScript it loaded, so after the
+    server restarts with new assets an open page can silently behave like an
+    older version — which is exactly how a source selection failed to travel
+    and the operator was told, wrongly, that they had selected nothing. The
+    page carries this stamp and compares it against the live server, so a
+    stale tab announces itself instead of misleading.
+    """
+    key = []
+    for name in sorted(STATIC_FILES):
+        asset = STATIC_DIR / name
+        try:
+            stat = asset.stat()
+            key.append((name, int(stat.st_mtime_ns), stat.st_size))
+        except OSError:
+            key.append((name, 0, 0))
+    key_tuple = tuple(key)
+    if _BUILD_CACHE["key"] != key_tuple:
+        digest = hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()[:12]
+        _BUILD_CACHE.update({"key": key_tuple, "id": digest})
+    return _BUILD_CACHE["id"]
+
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
@@ -459,6 +489,7 @@ def make_handler(
                     "last_indexed": latest,
                     "collections": collections,
                     "writes": writes_enabled,
+                    "build": build_id(),
                     "reports": _available_reports(reports_dir),
                 },
             )
@@ -488,6 +519,11 @@ def make_handler(
             asset = STATIC_DIR / name
             if not asset.is_file():
                 self._send(404, "text/plain; charset=utf-8", b"asset missing")
+                return
+            if name == "index.html":
+                body = asset.read_text(encoding="utf-8").replace("__BUILD__", build_id())
+                self._send(200, ctype, body.encode("utf-8"),
+                           extra={"Cache-Control": "no-cache, must-revalidate"})
                 return
             # Assets are read from disk per request and must never be served
             # from a stale browser cache: a fix that the operator cannot see

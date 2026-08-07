@@ -102,6 +102,15 @@ async function loadStatus() {
   const s = await api("/api/status");
   if (s.error) { $("index-meta").textContent = "index unavailable"; return; }
   state.writes = !!s.writes;
+
+  // A tab keeps running the JavaScript it loaded. If the server has newer
+  // assets, say so loudly rather than letting the page behave like an old
+  // version while looking current.
+  const meta = document.querySelector('meta[name="uplink-build"]');
+  const pageBuild = meta ? meta.getAttribute("content") : null;
+  if (pageBuild && s.build && pageBuild !== "__BUILD__" && pageBuild !== s.build) {
+    $("stale").hidden = false;
+  }
   state.reports = Array.isArray(s.reports) ? s.reports : [];
 
   $("index-meta").textContent =
@@ -223,6 +232,18 @@ function syncScope() {
   const note = $("scope-note");
   $("select-all-label").textContent =
     on === total ? "All sources" : on + " of " + total + " selected";
+  // What will actually be sent, visible before you ask.
+  const hint = $("scope-hint");
+  if (hint) {
+    if (total && on < total) {
+      hint.hidden = false;
+      hint.textContent = on === 0 ? "no sources" : on + " of " + total + " sources";
+      hint.className = "scope-hint" + (on === 0 ? " scope-none" : " scope-on");
+    } else {
+      hint.hidden = true;
+    }
+  }
+
   if (on === total || total === 0) {
     note.hidden = true;
   } else {
@@ -651,6 +672,7 @@ async function askAI() {
 $("composer").addEventListener("submit", (ev) => { ev.preventDefault(); runSearch(); });
 $("ai").addEventListener("click", askAI);
 $("clear-thread").addEventListener("click", clearHistory);
+$("stale-reload").addEventListener("click", () => window.location.reload(true));
 
 /* ------------------------------------------------------------ source reader */
 
@@ -1340,8 +1362,12 @@ $("upgo").addEventListener("click", async () => {
 
 $("coll").addEventListener("change", async (ev) => {
   state.collection = ev.target.value;
+  // Refresh status as well: the collection counts in this very dropdown go
+  // stale otherwise, which is how a page silently disagrees with the index.
+  await loadStatus();
   await loadSources();
   await loadNotes();
+  await loadMetrics();
 });
 
 const THEME_KEY = "uplink-theme";
