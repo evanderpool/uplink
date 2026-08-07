@@ -368,6 +368,30 @@ def test_hidden_attribute_beats_author_display_rules():
     assert css.index("[hidden]") < css.index(".reader {")
 
 
+def test_entrance_tweens_clean_up_after_themselves():
+    """gsap.from writes inline styles; a tween interrupted by a re-render
+    left source rows permanently half-faded and unreadable."""
+    assert 'clearProps: "opacity,transform"' in _extract("anim")
+
+
+def test_source_list_does_not_fade_in():
+    """A source list you cannot read while it settles is worse than no
+    animation at all."""
+    src = _extract("loadSources")
+    stagger = src[src.index('anim(list.querySelectorAll(".source")'):]
+    stagger = stagger[:stagger.index(");")]
+    assert "opacity" not in stagger
+
+
+def test_excluded_sources_stay_readable():
+    """Deselected rows are recoloured, not faded into illegibility."""
+    css = (Path(__file__).resolve().parents[1] / "uplink" / "static" / "app.css").read_text(
+        encoding="utf-8"
+    )
+    block = css[css.index(".source.off"):css.index(".source-body")]
+    assert "opacity" not in block
+
+
 def test_source_and_hit_openers_are_focusable_buttons():
     """Opening a source to verify a claim is the point of the product; it
     must not be mouse-only."""

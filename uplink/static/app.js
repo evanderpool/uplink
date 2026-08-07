@@ -43,7 +43,13 @@ const HAS_GSAP = typeof window.gsap !== "undefined";
 
 function anim(targets, vars) {
   if (!MOTION || !HAS_GSAP || !targets) return null;
-  try { return window.gsap.from(targets, vars); } catch (e) { return null; }
+  try {
+    // clearProps on completion: gsap.from writes inline styles, and a tween
+    // interrupted by a re-render (or a backgrounded tab) would otherwise
+    // leave rows permanently half-faded.
+    return window.gsap.from(targets, Object.assign(
+      { clearProps: "opacity,transform" }, vars));
+  } catch (e) { return null; }
 }
 function animTo(targets, vars) {
   if (!MOTION || !HAS_GSAP || !targets) return null;
@@ -206,8 +212,10 @@ async function loadSources() {
   syncScope();
   renderSuggestions(data.suggestions || []);
 
+  // Deliberately no opacity here: a source list that fades is a source
+  // list you cannot read while it settles.
   anim(list.querySelectorAll(".source"),
-       { opacity: 0, y: 14, duration: 0.42, stagger: 0.035, ease: "power3.out" });
+       { y: 10, duration: 0.3, stagger: 0.02, ease: "power2.out" });
 }
 
 function syncScope() {

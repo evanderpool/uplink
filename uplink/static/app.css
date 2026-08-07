@@ -252,7 +252,13 @@ input[type="checkbox"]:active { transform: scale(.88); }
   will-change: transform;
 }
 .source:hover { transform: translateY(-2px); box-shadow: var(--sh-1); border-color: var(--line); }
-.source.off { opacity: .42; }
+
+/* Excluded from retrieval — must stay READABLE. Fading a row to 40% makes
+   it unusable; recolouring says "off" without hiding what it is. */
+.source.off { background: transparent; border-color: var(--line); }
+.source.off .source-name { color: var(--muted); font-weight: 550; }
+.source.off .ftype { color: var(--muted); }
+.source.off .source-sub, .source.off .source-file { color: var(--muted); }
 .source-body { min-width: 0; flex: 1; }
 .source-name {
   display: block; width: 100%; text-align: left; padding: 0;
