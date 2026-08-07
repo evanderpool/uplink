@@ -144,48 +144,43 @@
     </div>
 
     <div class="studio-scroll">
-      <div class="stat-grid" id="stat-grid">
-        <div class="stat"><span class="stat-n" id="stat-docs">0</span><span class="stat-l">documents</span></div>
-        <div class="stat"><span class="stat-n" id="stat-chunks">0</span><span class="stat-l">chunks</span></div>
-      </div>
-
+      <p class="group-head">Quality</p>
       <div class="studio-block">
-        <h3>Retrieval accuracy</h3>
         <div id="accuracy" class="metric-card"></div>
       </div>
-
       <div class="studio-block">
-        <h3>Performance</h3>
+        <div id="failing" class="metric-card"></div>
+      </div>
+
+      <p class="group-head">Usage</p>
+      <div class="studio-block">
+        <div id="answer-metrics" class="metric-card"></div>
+      </div>
+      <div class="studio-block">
+        <div id="feedback-metrics" class="metric-card"></div>
+      </div>
+      <div class="studio-block">
         <div id="performance" class="metric-card"></div>
       </div>
 
+      <p class="group-head">Corpus</p>
       <div class="studio-block">
-        <h3>Feedback loop</h3>
-        <div id="feedback-metrics" class="metric-card"></div>
-      </div>
-
-      <div class="studio-block">
-        <h3>Corpus health</h3>
         <div id="health-metrics" class="metric-card"></div>
       </div>
 
+      <p class="group-head">Saved</p>
       <div class="studio-block">
-        <h3>Reports</h3>
         <div class="report-links" id="report-links"></div>
       </div>
 
       <div class="studio-block">
-        <h3>Saved notes</h3>
         <div id="notes" class="notes"></div>
         <p id="notes-empty" class="micro">
           Save an answer to keep it here — citations stay clickable.
         </p>
       </div>
 
-      <div class="studio-block">
-        <h3>Index</h3>
-        <p class="micro" id="index-meta">…</p>
-      </div>
+      <p class="micro" id="index-meta">…</p>
     </div>
   </section>
 </main>
@@ -220,6 +215,14 @@
   </div>
 </aside>
 <div id="scrim" class="scrim" hidden></div>
+
+<!-- One tooltip, moved and filled on demand. Shown on hover AND focus so
+     the explanations are reachable without a mouse. -->
+<div id="tip" class="tip" role="tooltip" hidden>
+  <p class="tip-title" id="tip-title"></p>
+  <p class="tip-body" id="tip-body"></p>
+  <p class="tip-cmd" id="tip-cmd"></p>
+</div>
 
 <script src="/static/gsap.min.js"></script>
 <script src="/static/app.js"></script>

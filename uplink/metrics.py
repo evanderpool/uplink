@@ -12,10 +12,37 @@ accuracy claims are checkable.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 MAX_LOG_LINES = 20_000  # a bounded tail keeps the endpoint cheap on big logs
+MAX_LIVE_EVAL_QUESTIONS = 120  # bounds the cost of scoring on every page load
+
+
+def wilson(successes: int, total: int, z: float = 1.96) -> list[float] | None:
+    """95% Wilson score interval for a proportion.
+
+    A rate measured on 13 questions is not the same claim as one measured on
+    1,300, and reporting it bare invites exactly the challenge it deserves.
+    Wilson (rather than the normal approximation) stays sane at small n and
+    near 0% or 100%, which is where small fixture sets actually live.
+    """
+    if total <= 0:
+        return None
+    p = successes / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    margin = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denom
+    return [round(max(0.0, centre - margin), 3), round(min(1.0, centre + margin), 3)]
+
+
+def _parse_ts(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _tail_jsonl(path: Path, limit: int = MAX_LOG_LINES) -> list[dict]:
@@ -94,6 +121,26 @@ def accuracy(history_path: Path, db_name: str | None = None) -> dict:
         }
         for r in rows[-12:]
     ]
+    hit1 = latest.get("hit_at_1") or 0
+    hitk = latest.get("hit_at_k") or 0
+
+    # Did the last change help? The eval harness exists to answer exactly
+    # this, so the panel should not make the operator diff it by eye.
+    delta = None
+    if len(rows) > 1:
+        prev = rows[-2]
+        prev_total = prev.get("questions") or 0
+        if prev_total:
+            delta = {
+                "since": prev.get("label") or prev.get("ts", ""),
+                "hit_at_1": round(hit1 / total - (prev.get("hit_at_1") or 0) / prev_total, 3)
+                if total else 0,
+                "hit_at_k": round(hitk / total - (prev.get("hit_at_k") or 0) / prev_total, 3)
+                if total else 0,
+                "mrr": round((latest.get("mrr", 0) or 0) - (prev.get("mrr", 0) or 0), 3),
+                "comparable": prev.get("fixtures") == latest.get("fixtures"),
+            }
+
     return {
         "available": True,
         "ts": latest.get("ts", ""),
@@ -102,11 +149,61 @@ def accuracy(history_path: Path, db_name: str | None = None) -> dict:
         "db": latest.get("db", ""),
         "questions": total,
         "k": latest.get("k", 5),
-        "hit_at_1": round((latest.get("hit_at_1") or 0) / total, 3) if total else 0,
-        "hit_at_k": round((latest.get("hit_at_k") or 0) / total, 3) if total else 0,
+        "hit_at_1": round(hit1 / total, 3) if total else 0,
+        "hit_at_k": round(hitk / total, 3) if total else 0,
+        "hit_at_1_ci": wilson(hit1, total),
+        "hit_at_k_ci": wilson(hitk, total),
         "mrr": latest.get("mrr", 0),
         "runs": len(rows),
         "series": series,
+        "delta": delta,
+    }
+
+
+def live_accuracy(db_path: Path, fixtures_path: Path | None, k: int = 5) -> dict:
+    """Score the CURRENT index against the fixtures, right now.
+
+    The logged history is the published baseline; this is drift detection —
+    and, more usefully, it names the questions that are failing *today*,
+    which turns a score into a to-do list.
+    """
+    if not fixtures_path or not fixtures_path.exists():
+        return {"available": False, "reason": "no fixture file for this database"}
+    try:
+        from .evaluate import load_fixtures, run_eval
+
+        fixtures = load_fixtures(fixtures_path)
+        if not fixtures:
+            return {"available": False, "reason": "fixture file is empty"}
+        if len(fixtures) > MAX_LIVE_EVAL_QUESTIONS:
+            return {
+                "available": False,
+                "reason": f"{len(fixtures)} fixtures exceeds the live-scoring limit "
+                          f"({MAX_LIVE_EVAL_QUESTIONS}) — run `uplink eval` instead",
+            }
+        result = run_eval(db_path, fixtures_path, k=k)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    total = result.total or 0
+    failing = [
+        {"q": row["q"], "top_path": row.get("top_path", "")}
+        for row in result.per_question if not row.get("rank")
+    ]
+    weak = [
+        {"q": row["q"], "rank": row["rank"]}
+        for row in result.per_question if row.get("rank", 0) > 1
+    ]
+    return {
+        "available": True,
+        "fixtures": fixtures_path.name,
+        "questions": total,
+        "k": k,
+        "hit_at_1": round(result.hit_at_1 / total, 3) if total else 0,
+        "hit_at_k": round(result.hit_at_k / total, 3) if total else 0,
+        "mrr": round(result.mrr, 3),
+        "failing": failing,
+        "weak": weak,
     }
 
 
@@ -126,6 +223,88 @@ def performance(query_log: Path) -> dict:
             {"ts": r.get("ts", ""), "latency_ms": r.get("latency_ms"), "hits": r.get("hits", 0)}
             for r in searches[-30:]
         ],
+    }
+
+
+def answers(asks_dir: Path, query_log: Path, notes_path: Path | None = None) -> dict:
+    """The generative side — the part that was previously unmeasured.
+
+    Generation is what the product actually does, so it needs its own
+    numbers: how long an answer took, how many sources it stood on, and
+    whether a human then went and CHECKED one. That last figure —
+    verification rate — is the honest measure of whether citations are
+    doing their job or just decorating the answer.
+    """
+    if not asks_dir.is_dir():
+        return {"answered": 0}
+
+    opens: list[tuple[str, datetime]] = []
+    for row in _tail_jsonl(query_log):
+        if row.get("kind") in ("doc", "original") and row.get("path"):
+            ts = _parse_ts(row.get("ts"))
+            if ts:
+                opens.append((str(row["path"]), ts))
+
+    saved_titles = set()
+    if notes_path and notes_path.exists():
+        for note in _tail_jsonl(notes_path):
+            if not note.get("deleted") and note.get("title"):
+                saved_titles.add(str(note["title"]).strip().lower())
+
+    answered = 0
+    durations: list[float] = []
+    citation_counts: list[int] = []
+    verified = 0
+    uncited = 0
+    saved = 0
+
+    for resp_file in sorted(asks_dir.glob("*.response.json")):
+        try:
+            resp = json.loads(resp_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            continue
+        if not isinstance(resp, dict) or resp.get("state") != "answered":
+            continue
+        answered += 1
+
+        cites = resp.get("citations") if isinstance(resp.get("citations"), list) else []
+        citation_counts.append(len(cites))
+        if not cites:
+            uncited += 1
+
+        req_file = asks_dir / resp_file.name.replace(".response.json", ".request.json")
+        answered_at = _parse_ts(resp.get("ts"))
+        if req_file.exists() and answered_at:
+            try:
+                req = json.loads(req_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                req = {}
+            asked_at = _parse_ts(req.get("ts"))
+            if asked_at:
+                durations.append(max(0.0, (answered_at - asked_at).total_seconds()))
+            question = str(req.get("q", "")).strip().lower()
+            if question and question in saved_titles:
+                saved += 1
+
+        # Verified = a cited document was opened AFTER the answer landed.
+        cited_paths = {
+            str(c.get("path")) for c in cites
+            if isinstance(c, dict) and c.get("path")
+        }
+        if cited_paths and answered_at:
+            if any(p in cited_paths and ts >= answered_at for p, ts in opens):
+                verified += 1
+
+    return {
+        "answered": answered,
+        "median_seconds": round(sorted(durations)[len(durations) // 2], 1) if durations else None,
+        "avg_citations": round(sum(citation_counts) / len(citation_counts), 1)
+        if citation_counts else None,
+        "uncited_answers": uncited,
+        "verified": verified,
+        "verification_rate": round(verified / answered, 3) if answered else None,
+        "saved_as_notes": saved,
+        "save_rate": round(saved / answered, 3) if answered else None,
     }
 
 
@@ -167,10 +346,27 @@ def collect(
     feedback_log: Path,
     promoted: Path | None = None,
     db_name: str | None = None,
+    db_path: Path | None = None,
+    fixtures_dir: Path | None = None,
+    asks_dir: Path | None = None,
+    notes_path: Path | None = None,
 ) -> dict:
+    logged = accuracy(history_path, db_name)
+
+    # Score the live index against whichever fixture set this database was
+    # last measured with — that is the only fixture file we can honestly
+    # claim applies to it.
+    live = {"available": False, "reason": "no logged run names a fixture set"}
+    if db_path is not None and fixtures_dir is not None and logged.get("fixtures"):
+        live = live_accuracy(
+            db_path, fixtures_dir / logged["fixtures"], k=logged.get("k", 5)
+        )
+
     return {
         "health": health(conn),
-        "accuracy": accuracy(history_path, db_name),
+        "accuracy": logged,
+        "live": live,
         "performance": performance(query_log),
+        "answers": answers(asks_dir, query_log, notes_path) if asks_dir else {"answered": 0},
         "feedback": feedback_loop(feedback_log, promoted),
     }

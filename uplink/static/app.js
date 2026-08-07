@@ -57,6 +57,7 @@ function animTo(targets, vars) {
 }
 
 function countUp(node, value) {
+  if (!node) return;
   const target = Number(value) || 0;
   if (!MOTION || !HAS_GSAP) { node.textContent = String(target); return; }
   const state = { n: Number(node.textContent.replace(/[^0-9]/g, "")) || 0 };
@@ -103,8 +104,6 @@ async function loadStatus() {
   state.writes = !!s.writes;
   state.reports = Array.isArray(s.reports) ? s.reports : [];
 
-  countUp($("stat-docs"), s.documents);
-  countUp($("stat-chunks"), s.chunks);
   $("index-meta").textContent =
     "last indexed " + (s.last_indexed || "never") +
     (state.writes ? " · writes enabled (localhost)" : " · read-only bind");
@@ -434,9 +433,39 @@ function renderAnswer(card, resp, question) {
       collection: state.collection || null,
     });
     save.textContent = out.error ? "could not save" : "Saved ✓";
-    if (!out.error) { save.classList.add("on-good"); loadNotes(); }
+    if (!out.error) { save.classList.add("on-good"); loadNotes(); loadMetrics(); }
   });
   actions.appendChild(save);
+
+  // Rating the ANSWER, not just a search hit. Without this the feedback
+  // loop has no intake on the path people actually use, and an upvote here
+  // becomes a fixture whose expected documents are the ones it cited.
+  if (state.writes) {
+    const cites = Array.isArray(resp.citations) ? resp.citations : [];
+    const paths = cites
+      .filter((c) => c && typeof c === "object" && c.path)
+      .map((c) => String(c.path));
+    if (paths.length) {
+      const up = el("button", "mini", "\uD83D\uDC4D accurate");
+      const down = el("button", "mini", "\uD83D\uDC4E wrong");
+      const rate = async (verdict, btn, other) => {
+        const out = await postJSON("/api/feedback", {
+          q: question, path: paths[0], paths: paths, kind: "answer",
+          vote: verdict,
+          collection: cites[0].collection || state.collection || null,
+        });
+        if (!out.error) {
+          btn.className = "mini " + (verdict === "up" ? "on-good" : "on-bad");
+          other.className = "mini";
+          loadMetrics();
+        }
+      };
+      up.addEventListener("click", () => rate("up", up, down));
+      down.addEventListener("click", () => rate("down", down, up));
+      actions.appendChild(up);
+      actions.appendChild(down);
+    }
+  }
   card.appendChild(actions);
 
   anim(card, { opacity: 0, y: 16, duration: 0.45, ease: "power3.out" });
@@ -505,6 +534,7 @@ async function vote(hit, verdict, btn, other, question) {
     btn.className = "mini " + (verdict === "up" ? "on-good" : "on-bad");
     other.className = "mini";
     anim(btn, { scale: 0.82, duration: 0.3, ease: "back.out(3)" });
+    loadMetrics();
   }
 }
 
@@ -627,7 +657,9 @@ $("tab-original").addEventListener("click", () => showTab("original"));
 $("tab-text").addEventListener("click", () => showTab("text"));
 $("scrim").addEventListener("click", closeReader);
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && !$("reader").hidden) closeReader();
+  if (ev.key !== "Escape") return;
+  hideTip();
+  if (!$("reader").hidden) closeReader();
 });
 
 async function fetchDoc(path, collection, params, citedSeq) {
@@ -779,6 +811,102 @@ $("reader-next").addEventListener("click", () => {
 
 /* ----------------------------------------------------------------- metrics */
 
+// Every metric explains itself: what it means, how it is computed, and the
+// command that reproduces it — so no number on this panel has to be taken
+// on faith.
+const GLOSSARY = {
+  "hit@1": ["Hit rate at rank 1",
+    "The share of evaluation questions where the very FIRST result was a correct document. The strictest useful measure of retrieval.",
+    "python -m uplink eval fixtures/<set>.jsonl"],
+  "hit@k": ["Hit rate at rank k",
+    "The share of questions where a correct document appeared anywhere in the top k. Measures whether retrieval found it at all, ignoring rank.",
+    "python -m uplink eval fixtures/<set>.jsonl --k 5"],
+  "MRR": ["Mean reciprocal rank",
+    "Average of 1/rank of the first correct result. Rank 1 scores 1.0, rank 2 scores 0.5, rank 3 scores 0.33. Rewards ranking correctly, not merely finding.",
+    "python -m uplink eval fixtures/<set>.jsonl"],
+  "95% CI": ["Confidence interval",
+    "The range the true rate plausibly falls in, given how few questions were scored. A wide interval means the sample is small — not that the system is bad.",
+    "Wilson score interval, computed from the logged run"],
+  "questions": ["Fixture count",
+    "How many golden questions the score is based on. More questions, narrower interval, stronger claim.",
+    "wc -l fixtures/<set>.jsonl"],
+  "drift": ["Live vs published",
+    "The published baseline is a logged run. This re-scores the CURRENT index right now, so an index change that quietly broke retrieval shows up here.",
+    "python -m uplink eval fixtures/<set>.jsonl"],
+  "answers": ["Answers generated",
+    "Questions the brain session has answered from retrieved passages, with citations.",
+    "ls data/asks/*.response.json"],
+  "time to answer": ["Median time to answer",
+    "From queuing a question to the answer landing. This depends on a brain session being armed — it measures the workflow, not retrieval speed.",
+    "data/asks/*.json timestamps"],
+  "citations/answer": ["Average citations per answer",
+    "How many source passages each answer stood on. An answer with no citations is ungrounded and is counted separately.",
+    "data/asks/*.response.json"],
+  "verified": ["Verification rate",
+    "The share of answers where a cited source was actually OPENED afterwards. The honest test of whether citations do their job or just decorate the answer.",
+    "data/query-log.jsonl (kind=doc|original)"],
+  "saved": ["Save rate",
+    "Answers kept as notes. A strong satisfaction signal: people save what they intend to reuse.",
+    "data/notes.jsonl"],
+  "helpful": ["Helpful votes",
+    "Thumbs-up on results and answers. Upvotes become evaluation fixtures, which is how the system measures its own improvement.",
+    "python -m uplink promote"],
+  "helpful rate": ["Helpful rate",
+    "Thumbs-up as a share of all votes cast.",
+    "data/feedback.jsonl"],
+  "promoted": ["Promoted fixtures",
+    "Upvotes turned into permanent golden questions. Once promoted, a case is scored on every future eval run.",
+    "python -m uplink promote"],
+  "awaiting": ["Awaiting promotion",
+    "Upvotes not yet converted into fixtures — the actionable backlog of the self-improvement loop.",
+    "python -m uplink promote"],
+  "median latency": ["Median search latency",
+    "BM25 query time over the SQLite FTS5 index. Retrieval only; it excludes answer generation.",
+    "data/query-log.jsonl"],
+  "p95 latency": ["95th percentile latency",
+    "The slow tail: 19 of 20 searches finish faster than this.",
+    "data/query-log.jsonl"],
+  "zero-hit rate": ["Zero-hit rate",
+    "Searches that returned nothing. Each one is a vocabulary mismatch — the corpus likely holds the answer under different words.",
+    "data/query-log.jsonl"],
+  "unsearchable": ["Unsearchable documents",
+    "Indexed but produced no passages, usually an extraction failure. They inflate the document count while answering nothing.",
+    "python -m uplink status"],
+  "passages/doc": ["Average passages per document",
+    "Chunking density. Very low suggests extraction problems; very high suggests documents that could be split.",
+    "python -m uplink status"],
+};
+
+function attachTip(node, key) {
+  const entry = GLOSSARY[key];
+  if (!entry) return node;
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("aria-describedby", "tip");
+  node.classList.add("has-tip");
+  const show = () => showTip(node, entry);
+  node.addEventListener("mouseenter", show);
+  node.addEventListener("focus", show);
+  node.addEventListener("mouseleave", hideTip);
+  node.addEventListener("blur", hideTip);
+  return node;
+}
+
+function showTip(node, entry) {
+  const tip = $("tip");
+  $("tip-title").textContent = entry[0];
+  $("tip-body").textContent = entry[1];
+  $("tip-cmd").textContent = entry[2];
+  tip.hidden = false;
+  const r = node.getBoundingClientRect();
+  const width = 268;
+  let left = r.left - width - 12;
+  if (left < 8) left = Math.min(window.innerWidth - width - 8, r.right + 12);
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = Math.max(8, Math.min(window.innerHeight - 170, r.top - 4)) + "px";
+}
+
+function hideTip() { $("tip").hidden = true; }
+
 // A sparkline built from SVG DOM nodes — no library, no innerHTML.
 function sparkline(values, width, height) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -792,10 +920,10 @@ function sparkline(values, width, height) {
   const step = width / (nums.length - 1);
   const pts = nums.map((v, i) =>
     [i * step, height - ((v - lo) / span) * (height - 4) - 2]);
-  const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-  path.setAttribute("points", pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "));
-  path.setAttribute("class", "spark-line");
-  svg.appendChild(path);
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  line.setAttribute("points", pts.map((q) => q[0].toFixed(1) + "," + q[1].toFixed(1)).join(" "));
+  line.setAttribute("class", "spark-line");
+  svg.appendChild(line);
   const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
   dot.setAttribute("cx", pts[pts.length - 1][0].toFixed(1));
   dot.setAttribute("cy", pts[pts.length - 1][1].toFixed(1));
@@ -805,99 +933,202 @@ function sparkline(values, width, height) {
   return svg;
 }
 
-function metricRow(label, value, tone) {
+function cardTitle(box, text) {
+  box.appendChild(el("p", "card-title", text));
+}
+
+function metricRow(label, value, tone, tipKey) {
   const row = el("div", "mrow");
-  row.appendChild(el("span", "mrow-l", label));
+  row.appendChild(attachTip(el("span", "mrow-l", label), tipKey || label));
   row.appendChild(el("span", "mrow-v" + (tone ? " " + tone : ""), value));
   return row;
+}
+
+function heroBlock(box, value, label, sub, tipKey) {
+  const hero = el("div", "metric-hero");
+  hero.appendChild(el("span", "metric-hero-n", value));
+  hero.appendChild(attachTip(el("span", "metric-hero-l", label), tipKey || label));
+  box.appendChild(hero);
+  if (sub) box.appendChild(el("p", "metric-hero-sub", sub));
+}
+
+function fmtDelta(n, asPoints) {
+  const v = Number(n) || 0;
+  const shown = asPoints ? Math.round(v * 100) + "pp" : v.toFixed(3);
+  return (v > 0 ? "+" : "") + shown;
 }
 
 async function loadMetrics() {
   const m = await api("/api/metrics");
   if (m.error) return;
+  renderAccuracy(m);
+  renderFailing(m.live || {});
+  renderAnswers(m.answers || {});
+  renderFeedback(m.feedback || {});
+  renderPerformance(m.performance || {});
+  renderHealth(m.health || {});
+}
 
-  // ---- accuracy: the honest one. Missing means missing.
-  const acc = $("accuracy");
-  acc.replaceChildren();
-  if (!m.accuracy || !m.accuracy.available) {
-    acc.appendChild(el("p", "micro",
-      "No eval runs logged yet. Run `uplink eval fixtures/golden.jsonl --log` " +
-      "to record a measured baseline."));
-  } else {
-    const a = m.accuracy;
-    const big = el("div", "metric-hero");
-    big.appendChild(el("span", "metric-hero-n", fmtPct(a.hit_at_1)));
-    big.appendChild(el("span", "metric-hero-l", "hit@1"));
-    acc.appendChild(big);
-    acc.appendChild(metricRow("hit@" + a.k, fmtPct(a.hit_at_k)));
-    acc.appendChild(metricRow("MRR", Number(a.mrr).toFixed(3)));
-    acc.appendChild(metricRow("questions", String(a.questions)));
-    if (a.series && a.series.length > 1) {
-      const wrap = el("div", "spark-wrap");
-      wrap.appendChild(sparkline(a.series.map((s) => s.mrr), 200, 30));
-      wrap.appendChild(el("span", "micro", "MRR over " + a.runs + " logged runs"));
-      acc.appendChild(wrap);
+function renderAccuracy(m) {
+  const box = $("accuracy");
+  box.replaceChildren();
+  cardTitle(box, "Retrieval accuracy");
+  const a = m.accuracy || {};
+  if (!a.available) {
+    box.appendChild(el("p", "micro",
+      "Not measured yet. Run `uplink eval fixtures/golden.jsonl --log` to record a baseline."));
+    return;
+  }
+  const ci = Array.isArray(a.hit_at_1_ci)
+    ? "95% CI " + fmtPct(a.hit_at_1_ci[0]) + "-" + fmtPct(a.hit_at_1_ci[1]) +
+      " · n=" + a.questions
+    : "n=" + a.questions;
+  heroBlock(box, fmtPct(a.hit_at_1), "hit@1", ci);
+
+  box.appendChild(metricRow("hit@" + a.k, fmtPct(a.hit_at_k), "", "hit@k"));
+  if (Array.isArray(a.hit_at_k_ci)) {
+    box.appendChild(metricRow("95% CI",
+      fmtPct(a.hit_at_k_ci[0]) + "-" + fmtPct(a.hit_at_k_ci[1])));
+  }
+  box.appendChild(metricRow("MRR", Number(a.mrr).toFixed(3)));
+
+  if (a.delta) {
+    const d = a.delta;
+    const better = (Number(d.mrr) || 0) >= 0;
+    box.appendChild(metricRow("since " + String(d.since).slice(0, 26),
+      fmtDelta(d.hit_at_1, true) + " hit@1 · " + fmtDelta(d.mrr),
+      better ? "good" : "warn", "drift"));
+    if (!d.comparable) {
+      box.appendChild(el("p", "micro",
+        "Previous run used a different fixture set - not directly comparable."));
     }
-    acc.appendChild(el("p", "micro",
-      (a.label || "unlabeled run") + " · " + fmtWhen(a.ts) +
-      (a.fixtures ? " · " + a.fixtures : "")));
   }
 
-  // ---- performance
-  const perf = $("performance");
-  perf.replaceChildren();
-  const p = m.performance || {};
-  perf.appendChild(metricRow("median latency", fmtMs(p.median_ms), "good"));
-  perf.appendChild(metricRow("p95 latency", fmtMs(p.p95_ms)));
-  perf.appendChild(metricRow("searches logged", String(p.searches || 0)));
-  perf.appendChild(metricRow("sources opened", String(p.source_opens || 0)));
-  perf.appendChild(metricRow("zero-hit rate", fmtPct(p.zero_hit_rate),
-                             (p.zero_hit_rate || 0) > 0.25 ? "warn" : ""));
-  if (p.recent && p.recent.length > 1) {
+  if (a.series && a.series.length > 1) {
     const wrap = el("div", "spark-wrap");
-    wrap.appendChild(sparkline(p.recent.map((r) => r.latency_ms), 200, 26));
-    wrap.appendChild(el("span", "micro", "latency, last " + p.recent.length + " searches"));
-    perf.appendChild(wrap);
+    wrap.appendChild(sparkline(a.series.map((s) => s.mrr), 200, 30));
+    wrap.appendChild(el("span", "micro", "MRR across " + a.runs + " logged runs"));
+    box.appendChild(wrap);
   }
+  box.appendChild(el("p", "micro",
+    (a.label || "unlabeled run") + " · " + fmtWhen(a.ts) +
+    (a.fixtures ? " · " + a.fixtures : "")));
+}
 
-  // ---- human feedback loop
-  const fb = $("feedback-metrics");
-  fb.replaceChildren();
-  const f = m.feedback || {};
-  if (!f.total) {
-    fb.appendChild(el("p", "micro",
-      "No votes yet. Rate a result 👍/👎 — upvotes become eval fixtures via " +
-      "`uplink promote`, which is how the system improves itself."));
-  } else {
-    fb.appendChild(metricRow("helpful", String(f.up), "good"));
-    fb.appendChild(metricRow("off-target", String(f.down), f.down ? "warn" : ""));
-    fb.appendChild(metricRow("helpful rate", fmtPct(f.helpful_rate)));
-    fb.appendChild(metricRow("promoted to fixtures", String(f.promoted_fixtures)));
-    if (f.pending_promotion) {
-      fb.appendChild(metricRow("awaiting promotion", String(f.pending_promotion), "warn"));
-    }
-    (f.by_document || []).forEach((d) => {
-      const row = el("div", "mrow mrow-sub");
-      row.appendChild(el("span", "mrow-l", d.path));
-      row.appendChild(el("span", "mrow-v", "+" + d.up + " / -" + d.down));
-      fb.appendChild(row);
-    });
+function renderFailing(live) {
+  const box = $("failing");
+  box.replaceChildren();
+  cardTitle(box, "What is failing now");
+  if (!live.available) {
+    box.appendChild(el("p", "micro", String(live.reason || "live scoring unavailable")));
+    return;
   }
+  const failing = Array.isArray(live.failing) ? live.failing : [];
+  const weak = Array.isArray(live.weak) ? live.weak : [];
 
-  // ---- corpus health
-  const h = $("health-metrics");
-  h.replaceChildren();
-  const hh = m.health || {};
-  h.appendChild(metricRow("corpus size", fmtBytes(hh.bytes)));
-  h.appendChild(metricRow("avg passages/doc", String(hh.avg_chunks_per_doc || 0)));
-  if (hh.documents_without_chunks) {
-    h.appendChild(metricRow("unsearchable docs",
-                            String(hh.documents_without_chunks), "warn"));
+  box.appendChild(metricRow("live hit@1", fmtPct(live.hit_at_1), "", "drift"));
+  box.appendChild(metricRow("live MRR", Number(live.mrr).toFixed(3), "", "MRR"));
+
+  if (!failing.length && !weak.length) {
+    box.appendChild(el("p", "micro",
+      "Every fixture question returns a correct document at rank 1."));
+    return;
   }
-  (hh.by_type || []).forEach((r) => {
-    h.appendChild(metricRow("." + r.filetype, String(r.docs) + " docs"));
+  failing.forEach((f) => {
+    const row = el("div", "issue issue-bad");
+    row.appendChild(el("span", "issue-tag", "MISS"));
+    row.appendChild(el("span", "issue-q", f.q));
+    box.appendChild(row);
   });
-  h.appendChild(el("p", "micro", "last indexed " + (hh.last_indexed || "never")));
+  weak.forEach((w) => {
+    const row = el("div", "issue");
+    row.appendChild(el("span", "issue-tag", "rank " + w.rank));
+    row.appendChild(el("span", "issue-q", w.q));
+    box.appendChild(row);
+  });
+  box.appendChild(el("p", "micro",
+    "Misses are vocabulary mismatches - the answer is in the corpus under different words."));
+}
+
+function renderAnswers(a) {
+  const box = $("answer-metrics");
+  box.replaceChildren();
+  cardTitle(box, "Generated answers");
+  if (!a.answered) {
+    box.appendChild(el("p", "micro",
+      "No answers yet. Ask a question with Ask AI to start measuring the generative side."));
+    return;
+  }
+  heroBlock(box, fmtPct(a.verification_rate), "verified",
+            a.verified + " of " + a.answered + " answers had a cited source opened",
+            "verified");
+  box.appendChild(metricRow("answers", String(a.answered)));
+  box.appendChild(metricRow("time to answer",
+    a.median_seconds === null ? "—" : Math.round(a.median_seconds) + "s"));
+  box.appendChild(metricRow("citations/answer",
+    a.avg_citations === null ? "—" : String(a.avg_citations)));
+  if (a.uncited_answers) {
+    box.appendChild(metricRow("ungrounded", String(a.uncited_answers), "warn",
+                              "citations/answer"));
+  }
+  box.appendChild(metricRow("saved", fmtPct(a.save_rate), "", "saved"));
+}
+
+function renderFeedback(f) {
+  const box = $("feedback-metrics");
+  box.replaceChildren();
+  cardTitle(box, "Feedback loop");
+  if (!f.total) {
+    box.appendChild(el("p", "micro",
+      "No votes yet. Rate a result or an answer - upvotes become eval fixtures via " +
+      "`uplink promote`, which is how the system improves itself."));
+    return;
+  }
+  box.appendChild(metricRow("helpful", String(f.up), "good"));
+  box.appendChild(metricRow("off-target", String(f.down), f.down ? "warn" : ""));
+  box.appendChild(metricRow("helpful rate", fmtPct(f.helpful_rate)));
+  box.appendChild(metricRow("promoted", String(f.promoted_fixtures)));
+  if (f.pending_promotion) {
+    box.appendChild(metricRow("awaiting", String(f.pending_promotion), "warn"));
+  }
+  (f.by_document || []).forEach((d) => {
+    const row = el("div", "mrow mrow-sub");
+    row.appendChild(el("span", "mrow-l", d.path));
+    row.appendChild(el("span", "mrow-v", "+" + d.up + " / -" + d.down));
+    box.appendChild(row);
+  });
+}
+
+function renderPerformance(p) {
+  const box = $("performance");
+  box.replaceChildren();
+  cardTitle(box, "Performance");
+  box.appendChild(metricRow("median latency", fmtMs(p.median_ms), "good"));
+  box.appendChild(metricRow("p95 latency", fmtMs(p.p95_ms)));
+  box.appendChild(metricRow("searches", String(p.searches || 0)));
+  box.appendChild(metricRow("sources opened", String(p.source_opens || 0)));
+  box.appendChild(metricRow("zero-hit rate", fmtPct(p.zero_hit_rate),
+                            (p.zero_hit_rate || 0) > 0.25 ? "warn" : ""));
+}
+
+function renderHealth(h) {
+  const box = $("health-metrics");
+  box.replaceChildren();
+  cardTitle(box, "Corpus health");
+  box.appendChild(metricRow("documents", String(h.documents || 0)));
+  box.appendChild(metricRow("passages", String(h.chunks || 0)));
+  box.appendChild(metricRow("corpus size", fmtBytes(h.bytes)));
+  box.appendChild(metricRow("passages/doc", String(h.avg_chunks_per_doc || 0)));
+  if (h.documents_without_chunks) {
+    box.appendChild(metricRow("unsearchable", String(h.documents_without_chunks), "warn"));
+  }
+  (h.by_type || []).forEach((r) => {
+    const row = el("div", "mrow mrow-sub");
+    row.appendChild(el("span", "mrow-l", "." + r.filetype));
+    row.appendChild(el("span", "mrow-v", String(r.docs)));
+    box.appendChild(row);
+  });
+  box.appendChild(el("p", "micro", "last indexed " + (h.last_indexed || "never")));
 }
 
 /* ------------------------------------------------------------------- notes */

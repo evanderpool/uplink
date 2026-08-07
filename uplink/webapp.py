@@ -559,6 +559,10 @@ def make_handler(
                     feedback_log=feedback_log,
                     promoted=fixtures / "promoted.jsonl",
                     db_name=db_path.name,
+                    db_path=db_path,
+                    fixtures_dir=fixtures,
+                    asks_dir=asks_dir,
+                    notes_path=notes_path,
                 )
             finally:
                 conn.close()
@@ -928,14 +932,31 @@ def make_handler(
                 conn.close()
             if not known:
                 raise ValueError("path does not name an indexed document")
+            # An answer-level vote carries every document the answer cited,
+            # so promoting it yields a fixture that accepts any of them —
+            # which is what "this answer was right" actually means.
+            extra_paths = payload.get("paths")
+            paths: list[str] = []
+            if isinstance(extra_paths, list):
+                seen = {path}
+                paths = [path]
+                for candidate in extra_paths[:MAX_SOURCE_FILTER]:
+                    text = str(candidate or "").strip()[:500]
+                    if text and text not in seen:
+                        seen.add(text)
+                        paths.append(text)
+
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "q": q,
                 "path": path,
                 "seq": payload.get("seq") if isinstance(payload.get("seq"), int) else None,
                 "vote": vote,
+                "kind": "answer" if str(payload.get("kind")) == "answer" else "hit",
                 "collection": collection or None,
             }
+            if len(paths) > 1:
+                entry["paths"] = paths
             append_jsonl(feedback_log, entry)
             self._json(200, {"recorded": vote})
 

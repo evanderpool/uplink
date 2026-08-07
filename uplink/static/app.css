@@ -487,7 +487,6 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 /* ─────────────────────────────── studio ─────────────────────────────── */
 
 .studio-scroll { flex: 1; overflow-y: auto; padding: 0 16px 18px; min-height: 0; }
-.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 18px; }
 .stat {
   background: var(--surface-2); border-radius: var(--r-md); padding: 13px 14px;
   display: grid; gap: 2px;
@@ -499,43 +498,97 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 .stat-l { font-size: 10.5px; color: var(--muted); font-weight: 600;
           text-transform: uppercase; letter-spacing: .04em; }
 
-/* ───────────────────────────── metric cards ─────────────────────────── */
+/* ───────────────────────────── metric cards ─────────────────────────────
+ * One type scale for the whole Studio column:
+ *   group head  10px / 700 / uppercase / muted
+ *   card title  12px / 700 / ink
+ *   row         12px  (label ink-2, value 700 tabular ink)
+ *   footnote    11px / muted
+ * Values share a right-hand column and tabular figures so digits line up.
+ */
+
+.group-head {
+  margin: 22px 2px 8px; font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
+}
+.group-head:first-child { margin-top: 4px; }
 
 .metric-card {
   background: var(--surface-2); border-radius: var(--r-md);
-  padding: 12px 13px;
+  padding: 13px 14px 12px;
 }
-.metric-hero { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.card-title {
+  margin: 0 0 10px; font-size: 12px; font-weight: 700;
+  letter-spacing: -0.005em; color: var(--ink);
+}
+
+.metric-hero { display: flex; align-items: baseline; gap: 8px; }
 .metric-hero-n {
-  font-size: 26px; font-weight: 780; letter-spacing: -0.03em;
+  font-size: 30px; font-weight: 780; letter-spacing: -0.035em; line-height: 1.05;
   font-variant-numeric: tabular-nums;
   background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
-.metric-hero-l { font-size: 11px; color: var(--muted); font-weight: 650;
+.metric-hero-l { font-size: 11px; color: var(--ink-2); font-weight: 650;
                  text-transform: uppercase; letter-spacing: .05em; }
+.metric-hero-sub { margin: 4px 0 10px; font-size: 11px; color: var(--muted);
+                   font-variant-numeric: tabular-nums; }
+
 .mrow {
-  display: flex; align-items: baseline; gap: 8px;
-  padding: 3px 0; font-size: 11.5px;
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 4px 0; font-size: 12px; line-height: 1.35;
 }
-.mrow-l { color: var(--muted); overflow-wrap: anywhere; }
+.mrow-l { color: var(--ink-2); overflow-wrap: anywhere; }
 .mrow-v { margin-left: auto; font-weight: 700; color: var(--ink);
           font-variant-numeric: tabular-nums; white-space: nowrap; }
 .mrow-v.good { color: var(--good); }
 .mrow-v.warn { color: var(--brand-3); }
-.mrow-sub { padding-left: 8px; border-left: 2px solid var(--line); margin-top: 2px; }
-.mrow-sub .mrow-l { font-size: 10.5px; }
-.spark-wrap { margin: 10px 0 6px; display: grid; gap: 3px; }
+.mrow-sub { padding-left: 9px; border-left: 2px solid var(--line); margin-top: 1px; }
+.mrow-sub .mrow-l, .mrow-sub .mrow-v { font-size: 11px; color: var(--muted); }
+
+/* Labels that carry an explanation get a dotted underline — discoverable
+   without shouting, and reachable by keyboard. */
+.has-tip { border-bottom: 1px dotted var(--line-2); cursor: help; }
+.has-tip:hover, .has-tip:focus-visible { border-bottom-color: var(--brand-1);
+                                         color: var(--brand-1); }
+
+.issue {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 6px 0 6px 9px; margin-top: 4px;
+  border-left: 2px solid var(--line); font-size: 11.5px;
+}
+.issue-bad { border-left-color: var(--brand-3); }
+.issue-tag {
+  flex: none; font-size: 9.5px; font-weight: 800; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted);
+}
+.issue-bad .issue-tag { color: var(--brand-3); }
+.issue-q { color: var(--ink-2); overflow-wrap: anywhere; }
+
+.spark-wrap { margin: 12px 0 8px; display: grid; gap: 4px; }
 .spark-svg { width: 100%; height: 30px; overflow: visible; }
 .spark-line { fill: none; stroke: var(--brand-1); stroke-width: 1.8;
               stroke-linecap: round; stroke-linejoin: round; }
 .spark-dot { fill: var(--brand-3); }
 
-.studio-block { margin-bottom: 20px; }
-.studio-block h3 {
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
-  color: var(--muted); font-weight: 700; margin-bottom: 9px;
+/* ──────────────────────────────── tooltip ───────────────────────────── */
+
+.tip {
+  position: fixed; z-index: 20; width: 268px;
+  background: var(--surface); border: 1px solid var(--line-2);
+  border-radius: var(--r-md); box-shadow: var(--sh-3);
+  padding: 12px 14px; pointer-events: none;
 }
+.tip-title { margin: 0 0 5px; font-size: 12px; font-weight: 700; color: var(--ink); }
+.tip-body { margin: 0; font-size: 11.5px; line-height: 1.5; color: var(--ink-2); }
+.tip-cmd {
+  margin: 9px 0 0; padding-top: 8px; border-top: 1px solid var(--line);
+  font-family: "Cascadia Mono", Consolas, "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px; color: var(--muted); overflow-wrap: anywhere;
+}
+
+.studio-block { margin-bottom: 20px; }
+
 .report-links { display: flex; flex-wrap: wrap; gap: 7px; }
 .report-links a {
   background: var(--surface-2); border-radius: var(--r-pill);

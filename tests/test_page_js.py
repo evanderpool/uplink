@@ -31,7 +31,15 @@ DOM_SHIM = """
 class El {
   constructor(tag) { this.tag = tag; this.childNodes = []; this._text = "";
                      this.className = ""; this.hidden = false; this.disabled = false;
-                     this.title = ""; this.type = ""; this._on = {}; }
+                     this.title = ""; this.type = ""; this._on = {}; this.style = {};
+                     this.classList = {
+                       add: (c) => { this.className = (this.className + " " + c).trim(); },
+                       remove: (c) => { this.className =
+                         this.className.split(" ").filter((x) => x !== c).join(" "); },
+                       toggle: (c, on) => { if (on) this.classList.add(c);
+                                            else this.classList.remove(c); },
+                     }; }
+  getBoundingClientRect() { return {left: 0, right: 0, top: 0, bottom: 0}; }
   set textContent(v) { this._text = String(v); this.childNodes = []; }
   get textContent() {
     return this._text + this.childNodes.map((c) => c.textContent).join("");
@@ -105,10 +113,31 @@ def _extract(name: str) -> str:
                     return APP_JS[start:i + 1]
         raise AssertionError(f"unterminated function {name}")
 
-    arrow = f"const {name} = "
-    start = APP_JS.index(arrow)
-    end = APP_JS.index(";", start)
-    return APP_JS[start:end + 1]
+    # `const NAME = …;` — scan for the terminating semicolon while tracking
+    # string and bracket state, because a naive index(";") stops inside any
+    # prose that happens to contain one.
+    start = APP_JS.index(f"const {name} = ")
+    depth = 0
+    quote = None
+    i = start
+    while i < len(APP_JS):
+        ch = APP_JS[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return APP_JS[start:i + 1]
+        i += 1
+    raise AssertionError(f"unterminated declaration {name}")
 
 
 def _run(script: str, functions=("citationList", "renderAnswer", "citedPage",
@@ -454,3 +483,80 @@ def test_reader_records_original_availability():
     """))
     assert out["hasOriginal"] is False
     assert out["viewable"] is True
+
+
+# ---------------------------- pins for the metrics panel and tooltips
+
+def test_every_metric_label_has_an_explanation():
+    """A panel of unexplained jargon is a panel nobody trusts. Every label
+    rendered by a metric row must resolve in the glossary."""
+    out = _run(textwrap.dedent("""
+        const labels = Object.keys(GLOSSARY);
+        console.log(JSON.stringify({
+          count: labels.length,
+          mrr: GLOSSARY["MRR"].length,
+          hasCommand: GLOSSARY["hit@1"][2].indexOf("uplink") >= 0,
+          verified: GLOSSARY["verified"][0],
+        }));
+    """), functions=("GLOSSARY",))
+    assert out["count"] >= 15
+    assert out["mrr"] == 3, "definition, explanation, reproducing command"
+    assert out["hasCommand"] is True
+    assert out["verified"] == "Verification rate"
+
+
+def test_tooltip_targets_are_keyboard_reachable():
+    """Hover-only explanations are unreachable without a mouse."""
+    src = _extract("attachTip")
+    assert 'setAttribute("tabindex", "0")' in src
+    assert '"focus"' in src and '"blur"' in src
+    assert 'aria-describedby' in src
+
+
+def test_unknown_label_does_not_get_a_dead_tooltip():
+    out = _run(textwrap.dedent("""
+        const node = el("span", "mrow-l", "not a metric");
+        attachTip(node, "not a metric");
+        console.log(JSON.stringify({cls: node.className, tabindex: node.tabindex}));
+    """), functions=("GLOSSARY", "attachTip", "showTip", "hideTip"))
+    assert "has-tip" not in out["cls"]
+
+
+def test_accuracy_card_shows_its_confidence_interval():
+    """A rate without its interval is an overclaim when n is small."""
+    out = _run(textwrap.dedent("""
+        renderAccuracy({accuracy: {available: true, hit_at_1: 0.923, hit_at_k: 0.923,
+          hit_at_1_ci: [0.667, 0.986], hit_at_k_ci: [0.667, 0.986], mrr: 0.923,
+          questions: 13, k: 5, runs: 1, label: "baseline", ts: "2026-08-06T00:00",
+          fixtures: "industry-golden.jsonl", series: [], delta: null}});
+        console.log(JSON.stringify({text: $("accuracy").textContent}));
+    """), functions=("GLOSSARY", "attachTip", "showTip", "hideTip", "sparkline",
+                     "cardTitle", "metricRow", "heroBlock", "fmtDelta",
+                     "fmtPct", "fmtWhen", "renderAccuracy"))
+    assert "92%" in out["text"]
+    assert "95% CI 67%-99%" in out["text"]
+    assert "n=13" in out["text"]
+
+
+def test_unmeasured_accuracy_says_so_instead_of_showing_a_number():
+    out = _run(textwrap.dedent("""
+        renderAccuracy({accuracy: {available: false}});
+        console.log(JSON.stringify({text: $("accuracy").textContent}));
+    """), functions=("GLOSSARY", "attachTip", "showTip", "hideTip", "sparkline",
+                     "cardTitle", "metricRow", "heroBlock", "fmtDelta",
+                     "fmtPct", "fmtWhen", "renderAccuracy"))
+    assert "Not measured yet" in out["text"]
+    assert "%" not in out["text"].replace("hit@1", "")
+
+
+def test_failing_questions_are_listed_by_name():
+    out = _run(textwrap.dedent("""
+        renderFailing({available: true, hit_at_1: 0.66, mrr: 0.7,
+          failing: [{q: "when is hand hygiene required"}],
+          weak: [{q: "what are the phases", rank: 3}]});
+        console.log(JSON.stringify({text: $("failing").textContent}));
+    """), functions=("GLOSSARY", "attachTip", "showTip", "hideTip",
+                     "cardTitle", "metricRow", "fmtPct", "renderFailing"))
+    assert "MISS" in out["text"]
+    assert "when is hand hygiene required" in out["text"]
+    assert "rank 3" in out["text"]

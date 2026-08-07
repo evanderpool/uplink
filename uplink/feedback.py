@@ -82,6 +82,16 @@ def promote(feedback_path: Path, out_path: Path) -> tuple[int, int]:
             order.append(key)
         final[key] = {**vote, "q": q, "path": path}
 
+    def expected(vote: dict) -> list[str]:
+        """An upvoted ANSWER stood on every document it cited, so the fixture
+        it becomes should accept any of them — not just the first."""
+        paths = vote.get("paths")
+        if isinstance(paths, list):
+            clean = [str(p).strip() for p in paths if str(p or "").strip()]
+            if clean:
+                return list(dict.fromkeys(clean))
+        return [vote["path"]]
+
     added = 0
     for key in order:
         vote = final[key]
@@ -93,8 +103,9 @@ def promote(feedback_path: Path, out_path: Path) -> tuple[int, int]:
             out_path,
             {
                 "q": vote["q"],
-                "expect": [vote["path"]],
+                "expect": expected(vote),
                 "source": "feedback",
+                "kind": vote.get("kind", "hit"),
                 "collection": vote.get("collection"),
                 "ts": vote.get("ts"),
             },
