@@ -664,3 +664,32 @@ def test_busy_index_is_retried_once():
     rather than failing the file."""
     src = _extract("uploadOne")
     assert "503" in src and "await send()" in src
+
+
+def test_queue_shows_the_real_label_once_indexed():
+    """While a batch runs, rows should read as documents rather than as
+    vendor asset codes."""
+    out = _run(textwrap.dedent("""
+        queueFiles([{name:"ma658_macbook_air_late2008_userguide.pdf", size:1}]);
+        renderQueue();
+        const before = $("upqueue").textContent;
+        uploadQueue[0].state = "done";
+        uploadQueue[0].label = "MacBook Air User Guide";
+        uploadQueue[0].note = "75 passages";
+        renderQueue();
+        console.log(JSON.stringify({before: before, after: $("upqueue").textContent}));
+    """), functions=("queueFiles", "renderQueue"))
+    # Before indexing there is no title yet, so the filename stands in.
+    assert "ma658_macbook_air_late2008_userguide.pdf" in out["before"]
+    # After, the document's real name leads and the filename stays visible.
+    assert "MacBook Air User Guide" in out["after"]
+    assert "ma658_macbook_air_late2008_userguide.pdf" in out["after"]
+    assert "75 passages" in out["after"]
+
+
+def test_an_already_indexed_file_does_not_look_like_a_failure():
+    """Re-uploading an unchanged file produces zero new passages; reporting
+    '0 passages' reads as a failure when nothing went wrong."""
+    src = _extract("uploadOne")
+    assert "already indexed" in src
+    assert "data.indexed === 0" in src

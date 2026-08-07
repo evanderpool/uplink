@@ -292,3 +292,51 @@ def test_disambiguation_leaves_unique_labels_untouched():
     rows = [{"label": "Alpha", "path": "a.md"}, {"label": "Bravo", "path": "b.md"}]
     disambiguate_labels(rows)
     assert [r["label"] for r in rows] == ["Alpha", "Bravo"]
+
+
+def test_upload_reports_the_documents_real_name(tmp_path: Path):
+    """A batch should show what it indexed, not a list of vendor asset
+    codes: the extractor has just read the document's title, so the upload
+    response carries the name it will be known by."""
+    import json as _json
+
+    from test_webapp import _make_server, _multipart, _post
+
+    httpd, url, _ = _make_server(tmp_path, writes_enabled=True)
+    try:
+        body, ctype = _multipart({
+            "collection": ("", b"notes"),
+            "file": ("ma658_macbook_air_late2008_userguide.md",
+                     b"# MacBook Air User Guide\n\nSetting up your MacBook Air."),
+        })
+        code, resp = _post(url + "/api/upload", body, ctype)
+        assert code == 200, resp
+        data = _json.loads(resp)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert data["saved"] == "ma658_macbook_air_late2008_userguide.md"
+    # The H1 wins over the filename, exactly as the sources list would show.
+    assert data["label"] == "MacBook Air User Guide"
+
+
+def test_upload_label_falls_back_to_a_cleaned_filename(tmp_path: Path):
+    import json as _json
+
+    from test_webapp import _make_server, _multipart, _post
+
+    httpd, url, _ = _make_server(tmp_path, writes_enabled=True)
+    try:
+        body, ctype = _multipart({
+            "collection": ("", b"notes"),
+            "file": ("ma1966_mac-mini-m1-2020-qsg.txt", b"Setting up your Mac mini."),
+        })
+        code, resp = _post(url + "/api/upload", body, ctype)
+        data = _json.loads(resp)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert code == 200
+    assert data["label"] == "Mac Mini M1 2020 Quick Start Guide"

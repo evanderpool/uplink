@@ -1337,7 +1337,7 @@ function queueFiles(list) {
   let added = 0;
   for (const f of list || []) {
     if (uploadQueue.some((q) => q.file.name === f.name && q.file.size === f.size)) continue;
-    uploadQueue.push({ file: f, state: "waiting", note: "" });
+    uploadQueue.push({ file: f, state: "waiting", note: "", label: "" });
     added += 1;
   }
   renderQueue();
@@ -1355,7 +1355,17 @@ function renderQueue() {
   uploadQueue.forEach((item) => {
     const row = el("div", "upitem upitem-" + item.state);
     row.appendChild(el("span", "upitem-dot"));
-    row.appendChild(el("span", "upitem-name", item.file.name));
+
+    // Once indexed, the server sends back the name the document is known
+    // by — show that, and keep the filename underneath so the row still
+    // identifies the file on disk.
+    const body = el("div", "upitem-body");
+    body.appendChild(el("div", "upitem-name", item.label || item.file.name));
+    if (item.label && item.label !== item.file.name) {
+      body.appendChild(el("div", "upitem-file", item.file.name));
+    }
+    row.appendChild(body);
+
     row.appendChild(el("span", "upitem-note", item.note || item.state));
     box.appendChild(row);
   });
@@ -1381,7 +1391,12 @@ async function uploadOne(item, collection) {
     item.note = String(data.error).slice(0, 90);
   } else {
     item.state = "done";
-    item.note = data.chunks + (data.chunks === 1 ? " passage" : " passages");
+    item.label = data.label || item.file.name;
+    // A file already in the collection re-indexes to zero new passages.
+    // Reporting "0 passages" reads as a failure; it is not one.
+    item.note = (data.indexed === 0 && data.unchanged > 0)
+      ? "already indexed"
+      : data.chunks + (data.chunks === 1 ? " passage" : " passages");
   }
 }
 

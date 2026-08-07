@@ -771,3 +771,5 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 .upitem-done .upitem-note { color: var(--good); }
 .upitem-failed .upitem-dot { background: var(--bad); }
 .upitem-failed .upitem-note { color: var(--bad); }
+.upitem-body { flex: 1; min-width: 0; }
+.upitem-file { font-size: 10px; color: var(--muted); overflow-wrap: anywhere; margin-top: 1px; }

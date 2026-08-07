@@ -1024,10 +1024,26 @@ def make_handler(
                 target.unlink(missing_ok=True)
                 self._json(400, {"error": f"file could not be indexed: {own_errors[0]}"})
                 return
+
+            # Report the document by the name it will be KNOWN by, not the
+            # filename it arrived as: the extractor has just read its real
+            # title, so a batch can show what it actually indexed rather
+            # than a list of vendor asset codes.
+            conn = db.connect_ro(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT title FROM documents WHERE collection = ? AND path = ?",
+                    (collection, filename),
+                ).fetchone()
+            finally:
+                conn.close()
+            label = readable_label(row["title"] if row else None, filename)
+
             self._json(
                 200,
                 {
                     "saved": filename,
+                    "label": label,
                     "collection": collection,
                     "indexed": stats.indexed,
                     "unchanged": stats.unchanged,
