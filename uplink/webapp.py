@@ -6,6 +6,7 @@ JavaScript dependencies):
     GET  /                     the Ask page (search box + cited results)
     GET  /api/search?q=&k=&collection=   search results as JSON (read-only)
     GET  /api/status           index statistics as JSON
+    GET  /api/doc?path=&collection=&seq=&start=&limit=   source text (read-only)
     GET  /reports/<kind>.html  generated reports, if present
     POST /api/upload           add a document to a collection   (localhost only)
     POST /api/feedback         thumbs up/down on a result       (localhost only)
@@ -30,6 +31,15 @@ Security posture:
 - corpus text reaches the page as JSON and is rendered with textContent,
   never innerHTML, so document content cannot inject markup or script;
 - the query log and feedback log are local JSONL files next to the database.
+
+Read surface, stated plainly: `/api/doc` serves untruncated chunk text so a
+citation can be opened and checked — verification is the point of a RAG UI.
+That makes reads wider than `/api/search` alone (which truncates to 1200
+chars per hit), so anyone who can reach the port can page a document out in
+full. Reads are GETs and therefore unaffected by the localhost-only write
+rule: "ask-only" describes writes, not confidentiality. Both search and
+document reads are appended to the local query log. Before binding beyond
+loopback, decide that corpus reads by anyone on that network are acceptable.
 """
 
 from __future__ import annotations
@@ -59,6 +69,25 @@ MAX_FEEDBACK_BYTES = 10 * 1024
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]")
+
+
+# SQLite binds 64-bit integers; anything wider raises OverflowError at query
+# time, which would surface as a 500 with a traceback.
+_INT64_MAX = 2 ** 63 - 1
+
+
+def _int_param(params: dict, name: str, default: int | None) -> int | None:
+    """Parse one integer query parameter, falling back on anything odd."""
+    raw = (params.get(name) or [""])[0].strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if not -_INT64_MAX <= value <= _INT64_MAX:
+        return default
+    return value
 
 
 def sanitize_filename(raw: str) -> str:
@@ -177,6 +206,8 @@ def make_handler(
                     self._api_status()
                 elif url.path.startswith("/api/ask/"):
                     self._api_ask_status(url.path.removeprefix("/api/ask/"))
+                elif url.path == "/api/doc":
+                    self._api_doc(url)
                 elif url.path.startswith("/reports/"):
                     self._report(url.path)
                 else:
@@ -318,6 +349,105 @@ def make_handler(
                 self._send(404, "text/plain; charset=utf-8", b"report not generated yet")
                 return
             self._send(200, "text/html; charset=utf-8", page.read_bytes())
+
+        def _api_doc(self, url) -> None:
+            """Serve a window of one document's chunks so a citation can be
+            opened and checked.
+
+            The text comes from the INDEX, never the filesystem: the path is
+            an exact parameterized lookup in `documents`, so there is no file
+            read to traverse and nothing outside the corpus is reachable.
+            What you see here is literally what retrieval saw.
+            """
+            params = parse_qs(url.query)
+            path = (params.get("path") or [""])[0].strip()
+            if not path:
+                self._json(400, {"error": "missing path parameter"})
+                return
+            collection = (params.get("collection") or [""])[0].strip() or None
+            if collection is not None:
+                collection = db.validate_collection(collection)
+            seq = _int_param(params, "seq", default=None)
+            explicit_start = _int_param(params, "start", default=None)
+            limit = min(40, max(1, _int_param(params, "limit", default=9) or 9))
+
+            conn = db.connect_ro(db_path)
+            try:
+                if collection:
+                    docs = conn.execute(
+                        "SELECT id, path, title, filetype, collection FROM documents "
+                        "WHERE collection = ? AND path = ?", (collection, path),
+                    ).fetchall()
+                else:
+                    docs = conn.execute(
+                        "SELECT id, path, title, filetype, collection FROM documents "
+                        "WHERE path = ? ORDER BY collection", (path,),
+                    ).fetchall()
+                if not docs:
+                    self._json(404, {"error": "document not found in the index"})
+                    return
+                if len(docs) > 1:
+                    # Paths are relative to each collection root, so the same
+                    # name can exist in several. Guessing would show the
+                    # reader unrelated text as the source of a claim — fail
+                    # safe and make the caller name the collection.
+                    self._json(
+                        409,
+                        {
+                            "error": f"'{path}' exists in several collections — "
+                                     "name one with &collection=",
+                            "collections": [d["collection"] for d in docs],
+                        },
+                    )
+                    return
+                doc = docs[0]
+                total = conn.execute(
+                    "SELECT COUNT(*) n FROM chunks WHERE doc_id = ?", (doc["id"],)
+                ).fetchone()["n"]
+                # `start` pages absolutely; `seq` centres the window on a
+                # cited chunk. Mixing the two silently skipped chunks when
+                # paging backward, so `start` wins when both are present.
+                if explicit_start is not None:
+                    start = max(0, explicit_start)
+                elif seq is not None:
+                    start = max(0, seq - limit // 2)
+                else:
+                    start = 0
+                rows = conn.execute(
+                    "SELECT seq, section, text FROM chunks WHERE doc_id = ? "
+                    "AND seq >= ? ORDER BY seq LIMIT ?",
+                    (doc["id"], start, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+            # Reads are logged like searches: /api/doc returns untruncated
+            # text, so it belongs in the same local audit trail.
+            append_jsonl(
+                query_log,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "kind": "doc",
+                    "path": doc["path"],
+                    "collection": doc["collection"],
+                    "start": start,
+                    "chunks": len(rows),
+                },
+            )
+            self._json(
+                200,
+                {
+                    "path": doc["path"],
+                    "title": doc["title"],
+                    "filetype": doc["filetype"],
+                    "collection": doc["collection"],
+                    "total_chunks": total,
+                    "start": start,
+                    "chunks": [
+                        {"seq": r["seq"], "section": r["section"] or "", "text": r["text"]}
+                        for r in rows
+                    ],
+                },
+            )
 
         def _api_ask_status(self, ask_id: str) -> None:
             """Poll one queued question. Read-only: reads the response file
@@ -660,8 +790,37 @@ mark { background: none; color: var(--ink); font-weight: 650; }
   letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px; }
 .ans-text { font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ans-cites { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-.ans-cites span { color: var(--ink-2); font-size: 11.5px; border: 1px solid var(--border);
-  border-radius: 999px; padding: 2px 9px; overflow-wrap: anywhere; }
+.ans-cites button { color: var(--ink-2); font-size: 11.5px; border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px 9px; overflow-wrap: anywhere; background: none;
+  font-weight: 500; text-align: left; cursor: pointer; }
+.ans-cites button:hover { color: var(--ink); border-color: var(--accent); }
+.path.link { cursor: pointer; text-decoration: underline; text-decoration-style: dotted;
+  text-underline-offset: 3px; }
+.path.link:hover { color: var(--accent); }
+#viewer { margin: 12px 0; }
+.doc {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px 16px;
+}
+.doc-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+  border-bottom: 1px solid var(--grid); padding-bottom: 8px; margin-bottom: 10px; }
+.doc-title { font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+.doc-meta { color: var(--muted); font-size: 11.5px; }
+.doc-close { margin-left: auto; background: none; border: 1px solid var(--border);
+  color: var(--ink-2); border-radius: 8px; font-size: 12px; padding: 2px 10px; font-weight: 500; }
+.chunk { border-left: 2px solid var(--grid); padding: 2px 0 2px 12px; margin: 12px 0; }
+.chunk.cited { border-left-color: var(--accent); }
+.chunk-head { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  margin-bottom: 4px; }
+.chunk-text { font-size: 12.5px; line-height: 1.55; white-space: pre-wrap;
+  overflow-wrap: anywhere; color: var(--ink-2); }
+.chunk.cited .chunk-text { color: var(--ink); }
+.doc-nav { display: flex; gap: 8px; align-items: center; margin-top: 12px;
+  border-top: 1px solid var(--grid); padding-top: 10px; }
+.doc-nav button { background: none; border: 1px solid var(--border); color: var(--ink-2);
+  border-radius: 8px; font-size: 12px; padding: 3px 12px; font-weight: 500; }
+.doc-nav button:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-2); }
+.doc-nav span { color: var(--muted); font-size: 11.5px; }
 .ans-wait { color: var(--muted); font-size: 12.5px; padding: 10px 2px; }
 button.secondary { background: none; color: var(--accent); border: 1px solid var(--accent); }
 details#up { margin-top: 28px; }
@@ -693,6 +852,7 @@ footer { margin-top: 36px; color: var(--muted); font-size: 11px; }
 </form>
 <div id="meta"></div>
 <div id="answer"></div>
+<div id="viewer"></div>
 <div id="results"></div>
 <details id="up" hidden>
   <summary>Add a document</summary>
@@ -761,8 +921,13 @@ function renderAnswer(resp, question) {
       if (!c || typeof c !== "object") return;
       const path = String(c.path || "");
       if (!path) return;
-      const chip = document.createElement("span");
+      // Clickable: a citation you cannot open is a claim, not evidence.
+      const chip = document.createElement("button");
+      chip.type = "button";
       chip.textContent = path + (c.section ? " > " + String(c.section) : "");
+      chip.title = "open this source and read the indexed text";
+      const seq = Number.isInteger(c.seq) ? c.seq : null;
+      chip.addEventListener("click", () => openDoc(path, c.collection || null, seq));
       cites.appendChild(chip);
     });
     if (cites.childNodes.length) card.appendChild(cites);
@@ -773,6 +938,7 @@ function renderAnswer(resp, question) {
 function clearAnswer() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   $("answer").replaceChildren();
+  $("viewer").replaceChildren();
   $("ai").disabled = false;
 }
 
@@ -825,6 +991,126 @@ async function askAI() {
 
 $("ai").addEventListener("click", askAI);
 
+// --- source viewer: open any citation and read what retrieval actually saw ---
+
+function closeViewer() { $("viewer").replaceChildren(); }
+
+function renderDoc(doc, citedSeq) {
+  // Every value is coerced and inserted as text; document content never
+  // becomes markup here any more than it does in a search result.
+  const box = $("viewer");
+  box.replaceChildren();
+  const card = document.createElement("div");
+  card.className = "doc";
+
+  const head = document.createElement("div");
+  head.className = "doc-head";
+  const title = document.createElement("span");
+  title.className = "doc-title";
+  title.textContent = String(doc.path || "");
+  head.appendChild(title);
+  const meta = document.createElement("span");
+  meta.className = "doc-meta";
+  const total = Number(doc.total_chunks) || 0;
+  meta.textContent = "source text from the index \\u00B7 " +
+    String(doc.collection || "") + " \\u00B7 " + total + " chunks";
+  head.appendChild(meta);
+  const close = document.createElement("button");
+  close.className = "doc-close";
+  close.textContent = "close";
+  close.addEventListener("click", closeViewer);
+  head.appendChild(close);
+  card.appendChild(head);
+
+  const chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
+  chunks.forEach((c) => {
+    if (!c || typeof c !== "object") return;
+    const div = document.createElement("div");
+    // Number.isInteger, not ==: Number(null) is 0, which would mark chunk
+    // #0 as "the cited passage" whenever a citation carries no seq.
+    const isCited = Number.isInteger(citedSeq) && Number(c.seq) === Number(citedSeq);
+    div.className = "chunk" + (isCited ? " cited" : "");
+    const h = document.createElement("div");
+    h.className = "chunk-head";
+    h.textContent = "#" + String(c.seq) + (c.section ? " \\u00B7 " + String(c.section) : "");
+    div.appendChild(h);
+    const t = document.createElement("div");
+    t.className = "chunk-text";
+    t.textContent = String(c.text || "");
+    div.appendChild(t);
+    card.appendChild(div);
+  });
+
+  const start = Number(doc.start) || 0;
+  const shown = chunks.length;
+  const nav = document.createElement("div");
+  nav.className = "doc-nav";
+  // Paging uses an ABSOLUTE start, never a seq to re-centre on: centring
+  // shifts the window by limit/2 as well, which silently skipped chunks
+  // every time the reader stepped backward.
+  const prev = document.createElement("button");
+  prev.textContent = "\\u2190 earlier";
+  prev.disabled = start <= 0;
+  prev.addEventListener("click", () =>
+    openDocAt(doc.path, doc.collection, Math.max(0, start - shown), citedSeq));
+  const next = document.createElement("button");
+  next.textContent = "later \\u2192";
+  next.disabled = start + shown >= total;
+  next.addEventListener("click", () =>
+    openDocAt(doc.path, doc.collection, start + shown, citedSeq));
+  const pos = document.createElement("span");
+  pos.textContent = shown
+    ? "showing " + (start + 1) + "\\u2013" + (start + shown) + " of " + total
+    : "no text";
+  nav.appendChild(prev);
+  nav.appendChild(next);
+  nav.appendChild(pos);
+  card.appendChild(nav);
+
+  box.appendChild(card);
+  card.scrollIntoView({ block: "nearest" });
+}
+
+async function fetchDoc(path, collection, params, citedSeq) {
+  const box = $("viewer");
+  box.replaceChildren();
+  const wait = document.createElement("div");
+  wait.className = "ans-wait";
+  wait.textContent = "opening " + String(path) + "\\u2026";
+  box.appendChild(wait);
+  let url = "/api/doc?path=" + encodeURIComponent(path);
+  if (collection) url += "&collection=" + encodeURIComponent(collection);
+  url += params;
+  try {
+    const r = await fetch(url);
+    const doc = await r.json();
+    if (doc.error) {
+      let msg = "cannot open: " + String(doc.error);
+      if (Array.isArray(doc.collections) && doc.collections.length) {
+        msg += " (" + doc.collections.map(String).join(", ") + ")";
+      }
+      wait.textContent = msg;
+      return;
+    }
+    renderDoc(doc, citedSeq);
+  } catch (e) {
+    wait.textContent = "could not load the source document";
+  }
+}
+
+// Open centred on a cited chunk.
+function openDoc(path, collection, seq) {
+  const anchored = Number.isInteger(seq);
+  return fetchDoc(path, collection,
+    anchored ? "&seq=" + encodeURIComponent(seq) : "",
+    anchored ? seq : null);
+}
+
+// Page to an absolute offset, keeping whatever chunk was cited highlighted.
+function openDocAt(path, collection, start, citedSeq) {
+  return fetchDoc(path, collection, "&start=" + encodeURIComponent(start), citedSeq);
+}
+
 function renderSnippet(el, snippet) {
   // The API marks matches with non-printable \\u0001/\\u0002 delimiters (so
   // corpus text containing [ ] renders intact); matched spans become bold
@@ -864,8 +1150,10 @@ function renderHit(h) {
   const cite = document.createElement("div");
   cite.className = "cite";
   const path = document.createElement("span");
-  path.className = "path";
+  path.className = "path link";
   path.textContent = h.path;
+  path.title = "open this document at this passage";
+  path.addEventListener("click", () => openDoc(h.path, h.collection, h.seq));
   cite.appendChild(path);
   if (h.collection) {
     const c = document.createElement("span");

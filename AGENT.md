@@ -131,8 +131,17 @@ for 15 minutes, but an unanswered queue eventually blocks new questions
    from pathlib import Path
    from uplink.asks import write_answer
    write_answer(Path("data/asks"), "<id>", "<answer text>",
-                citations=[{"path": "...", "section": "..."}, ...])
+                citations=[{"path": ..., "section": ..., "seq": ..., "collection": ...}])
    ```
+
+   **Citations must be index coordinates, copied verbatim from the search
+   JSON — `path`, `section`, `seq`, and `collection` exactly as returned.**
+   They are not prose labels. The page renders each one as a button that
+   opens `GET /api/doc` at that chunk so the reader can check your claim
+   against the indexed text; a hand-written section string ("p. 21-22")
+   still opens the document but cannot anchor to the passage, and a
+   hand-written path opens nothing at all. If a claim rests on several
+   passages, cite each one.
 
    On failure, write `state="error"` with a short `error` message instead
    of leaving the ask pending forever.

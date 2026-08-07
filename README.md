@@ -167,6 +167,26 @@ sits behind the same localhost-only write gate as uploads, capped at 25
 pending, and the watcher will not re-fire an unanswered question for 15
 minutes.
 
+## Verifiable citations
+
+Every citation is a button, and every search result's path is a link: click
+one and the source panel opens **the indexed text itself**, centred on the
+cited chunk and pageable through the rest of the document. A citation you
+cannot open is a claim, not evidence.
+
+What you see is what retrieval saw — `GET /api/doc` reads chunks from the
+index, never the filesystem, so there is no file-read surface to traverse and
+nothing outside the corpus is reachable. A path that exists in more than one
+collection returns 409 with the candidates rather than guessing, because
+guessing would present unrelated text as the source of a claim. Citations
+carry `path`, `section`, `seq`, and `collection` straight from the search
+JSON so they anchor exactly; `AGENT.md` makes that a requirement of the
+answering contract.
+
+Note the trade-off: document reads are GETs, so they work wherever the page
+does — the localhost-only rule governs writes, not confidentiality. Search
+and document reads are both appended to `data/query-log.jsonl`.
+
 The index lives at `data/uplink.db` by default (`--db` to override) and is
 never committed — it may contain private corpus content.
 
@@ -232,7 +252,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (143 tests) covers every extractor (including a byte-level
+The suite (169 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on
@@ -245,7 +265,9 @@ DNS-rebinding defenses, upload constraints (traversal, overwrite, size,
 byte-exactness, cleanup on failure), the feedback→promote loop, and the ask
 queue (id validation, malformed-response handling, cap-under-concurrency,
 watcher dedup, and the answer-card render contract executed as real
-JavaScript in a DOM shim) — every finding from the adversarial reviews is
+JavaScript in a DOM shim), and the source viewer (index-only reads,
+ambiguous-path refusal, gapless paging across a whole document, int64
+overflow, audit logging) — every finding from the adversarial reviews is
 pinned by a regression test.
 
 ## License
