@@ -753,3 +753,21 @@ mark { background: color-mix(in srgb, var(--brand-3) 26%, transparent);
 }
 .scope-on { color: var(--brand-1); background: color-mix(in srgb, var(--brand-1) 12%, transparent); }
 .scope-none { color: var(--brand-3); background: color-mix(in srgb, var(--brand-3) 15%, transparent); }
+
+/* upload queue */
+.upqueue { margin-top: 9px; display: grid; gap: 4px; max-height: 190px; overflow-y: auto; }
+.upitem {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11px; padding: 4px 6px; border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.upitem-dot { width: 6px; height: 6px; border-radius: 50%; flex: none;
+              background: var(--muted); }
+.upitem-name { overflow-wrap: anywhere; color: var(--ink-2); flex: 1; min-width: 0; }
+.upitem-note { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.upitem-indexing .upitem-dot { background: var(--brand-1); }
+.upitem-indexing .upitem-name { color: var(--ink); font-weight: 600; }
+.upitem-done .upitem-dot { background: var(--good); }
+.upitem-done .upitem-note { color: var(--good); }
+.upitem-failed .upitem-dot { background: var(--bad); }
+.upitem-failed .upitem-note { color: var(--bad); }

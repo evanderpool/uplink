@@ -38,8 +38,8 @@ def _json(url: str, path: str) -> dict:
          "Guideline for Disinfection and Sterilization"),
         # Filename fallbacks get tidied into something readable.
         ("nist-sp-800-53r5-security-controls", "nist-sp-800-53r5-security-controls.pdf",
-         "NIST SP 800 53R5 Security Controls"),
-        ("apple-10k-fy2023", "apple-10k-fy2023.txt", "Apple 10K FY2023"),
+         "NIST SP 800 53 R5 Security Controls"),
+        ("apple-10k-fy2023", "apple-10k-fy2023.txt", "Apple 10-K FY 2023"),
         ("quarterly_budget_review", "quarterly_budget_review.xlsx",
          "Quarterly Budget Review"),
         (None, "runbook.md", "Runbook"),
@@ -237,3 +237,58 @@ def test_doc_endpoint_advertises_original_availability(server):
     assert doc["has_original"] is True
     assert doc["viewable"] is True
     assert doc["label"] == "Runbook"
+
+
+# ------------------- professional labels (proper casing + disambiguation)
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        # Vendor asset codes carry no meaning for a reader.
+        ("ma658_macbook_air_late2008_userguide.pdf", "MacBook Air Late 2008 User Guide"),
+        # Abbreviations expand; conventional casing is preserved.
+        ("ma1966_mac-mini-m1-2020-qsg.pdf", "Mac Mini M1 2020 Quick Start Guide"),
+        ("ma1733_imac-late2015-essentials.pdf", "iMac Late 2015 Essentials"),
+        # Run-together tokens are split on known terms.
+        ("ma564_powerbookg4_gettingstarted.pdf", "PowerBook G4 Getting Started"),
+        # Specifications read the way they are written.
+        ("macbook-pro-14inch-m4pro-2024-info.pdf",
+         "MacBook Pro 14-inch M4 Pro 2024 Information"),
+    ],
+)
+def test_labels_are_professionally_cased(path, expected):
+    assert readable_label(None, path) == expected
+
+
+def test_a_real_title_is_never_rewritten():
+    """The author's name for a document beats anything derived from a
+    filename, so an embedded title is used exactly as written."""
+    assert readable_label(
+        "PowerBook G4 12-inch (1.5 GHz) User's Guide (Manual)",
+        "ma572_powerbookg4_12inch1_5ghzuserguide.pdf",
+    ) == "PowerBook G4 12-inch (1.5 GHz) User's Guide (Manual)"
+
+
+def test_duplicate_labels_are_disambiguated():
+    """Vendors reuse one title across many files; a dozen sources all named
+    'MacBook Pro' is a list you cannot navigate."""
+    from uplink.webapp import disambiguate_labels
+
+    rows = [
+        {"label": "MacBook Pro", "path": "ma1526_macbook_pro_17inch_mid2010.pdf"},
+        {"label": "MacBook Pro", "path": "ma1567_macbook_pro_15inch_early2011.pdf"},
+        {"label": "iMac Quick Start", "path": "ma1728_imac-late2015-quickstart.pdf"},
+    ]
+    disambiguate_labels(rows)
+    assert rows[0]["label"] == "MacBook Pro — 17-inch Mid 2010"
+    assert rows[1]["label"] == "MacBook Pro — 15-inch Early 2011"
+    # A label that was already unique is left alone.
+    assert rows[2]["label"] == "iMac Quick Start"
+
+
+def test_disambiguation_leaves_unique_labels_untouched():
+    from uplink.webapp import disambiguate_labels
+
+    rows = [{"label": "Alpha", "path": "a.md"}, {"label": "Bravo", "path": "b.md"}]
+    disambiguate_labels(rows)
+    assert [r["label"] for r in rows] == ["Alpha", "Bravo"]

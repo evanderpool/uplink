@@ -148,38 +148,161 @@ def _int_param(params: dict, name: str, default: int | None) -> int | None:
     return value
 
 
-_ACRONYMS = {"pdf", "csv", "tsv", "faq", "sop", "kpi", "api", "sec", "nist", "cdc",
-             "cui", "iot", "sp", "ai", "hr", "it", "us", "eu", "uk", "q1", "q2",
-             "q3", "q4", "fy", "10k", "10q", "8k"}
+# Terms whose conventional casing a title-caser would get wrong. Generic
+# enough to serve any technical corpus; extend rather than special-case.
+_TERM_CASING = {
+    "macbook": "MacBook", "imac": "iMac", "emac": "eMac", "ipad": "iPad",
+    "iphone": "iPhone", "ipod": "iPod", "ibook": "iBook", "isight": "iSight",
+    "powerbook": "PowerBook", "powermac": "Power Mac", "macos": "macOS",
+    "airport": "AirPort", "firewire": "FireWire", "magsafe": "MagSafe",
+    "thunderbolt": "Thunderbolt", "bootcamp": "Boot Camp",
+    "pdf": "PDF", "csv": "CSV", "tsv": "TSV", "usb": "USB", "hdmi": "HDMI",
+    "ghz": "GHz", "mhz": "MHz", "vesa": "VESA", "faq": "FAQ", "sop": "SOP",
+    "kpi": "KPI", "api": "API", "sec": "SEC", "nist": "NIST", "cdc": "CDC",
+    "cisa": "CISA", "bls": "BLS", "cui": "CUI", "iot": "IoT", "sp": "SP",
+    "ai": "AI", "hr": "HR", "it": "IT", "us": "US", "eu": "EU", "uk": "UK",
+    "q1": "Q1", "q2": "Q2", "q3": "Q3", "q4": "Q4", "fy": "FY",
+    "10k": "10-K", "10q": "10-Q", "8k": "8-K",
+    "4k": "4K", "5k": "5K", "1080p": "1080p", "retina": "Retina",
+}
+
+# Abbreviations that appear in documentation filenames and mean nothing to
+# a reader as-is.
+_DOC_TYPES = {
+    "ug": "User Guide", "userguide": "User Guide", "usersguide": "User Guide",
+    "qsg": "Quick Start Guide", "qs": "Quick Start", "quickstart": "Quick Start",
+    "gettingstarted": "Getting Started", "ipig": "Important Product Information",
+    "info": "Information", "essentials": "Essentials", "manual": "Manual",
+}
+
+# A leading vendor asset code ("ma658_", "doc12-") identifies a file in some
+# catalogue; it tells a reader nothing and only crowds the label.
+_ASSET_ID = re.compile(r"^[a-z]{1,3}\d{2,6}$", re.I)
+_LETTER_DIGIT = re.compile(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])")
+
+
+def _cased(word: str) -> str:
+    low = word.lower()
+    if low in _TERM_CASING:
+        return _TERM_CASING[low]
+    if low in _DOC_TYPES:
+        return _DOC_TYPES[low]
+    if word.isdigit():
+        return word
+    return word[:1].upper() + word[1:]
+
+
+# Longest-first so "powerbook" wins over any shorter prefix. Restricted to
+# terms of four characters or more (plus a couple of explicit units) because
+# short ones match inside ordinary words.
+_PEELABLE = sorted(
+    {t for t in list(_TERM_CASING) + list(_DOC_TYPES) if len(t) >= 4}
+    | {"ghz", "mhz", "inch"},
+    key=len, reverse=True,
+)
+
+
+def _peel(token: str) -> list[str]:
+    """Split a run-together filename token using known terms.
+
+    Filenames like "powerbookg4" and "33ghzgettingstarted" carry no
+    separators at all; peeling recognised terms off the front recovers the
+    words a reader expects to see.
+    """
+    low = token.lower()
+    parts: list[str] = []
+    i = 0
+    while i < len(low):
+        hit = next((term for term in _PEELABLE if low.startswith(term, i)), None)
+        if hit:
+            parts.append(low[i:i + len(hit)])
+            i += len(hit)
+            continue
+        j = i + 1
+        while j < len(low):
+            if low[j].isdigit() != low[i].isdigit():
+                break
+            if any(low.startswith(term, j) for term in _PEELABLE):
+                break
+            j += 1
+        parts.append(low[i:j])
+        i = j
+    return parts
 
 
 def readable_label(title: str | None, path: str) -> str:
     """A human-readable name for a document.
 
-    A real title (a PDF's own title, a Markdown H1) is used as-is. When the
-    extractor could only fall back to the filename, the filename is tidied
-    into something a person would read — separators become spaces, words are
-    capitalised, and known acronyms stay upper-case — because
-    'nist-sp-800-53r5-security-controls' is a filename, not a label.
+    A real title — a PDF's own /Title, a Markdown H1 — is used as written,
+    because the author's name for the document beats anything derived from
+    a filename. Only when the extractor could fall back no further than the
+    filename is one constructed: vendor asset codes dropped, separators and
+    letter/digit runs split, known abbreviations expanded, and terms cased
+    the way they are conventionally written.
     """
     stem = Path(path).stem
     clean = (title or "").strip()
     if clean and clean.lower() != stem.lower():
         return clean
 
-    words = re.split(r"[-_.\s]+", stem)
-    out = []
-    for w in words:
-        if not w:
+    raw = [w for w in re.split(r"[-_.\s]+", stem) if w]
+    if raw and _ASSET_ID.match(raw[0]) and len(raw) > 1:
+        raw = raw[1:]
+
+    words: list[str] = []
+    for token in raw:
+        low = token.lower()
+        # A token that is itself a known term keeps its shape: splitting
+        # "10k" into "10" and "k" would lose the form people recognise.
+        if low in _TERM_CASING or low in _DOC_TYPES:
+            words.append(token)
             continue
-        low = w.lower()
-        if low in _ACRONYMS:
-            out.append(w.upper())
-        elif any(ch.isdigit() for ch in w):
-            out.append(w.upper() if len(w) <= 6 else w)
-        else:
-            out.append(w[:1].upper() + w[1:])
+        words.extend(_peel(token))
+
+    out: list[str] = []
+    for word in words:
+        cased = _cased(word)
+        # "g" + "4" -> "G4"; a stray letter before a number is a model code.
+        if out and word.isdigit() and len(out[-1]) == 1 and out[-1].isalpha():
+            out[-1] = out[-1].upper() + word
+            continue
+        # "14" + "inch" -> "14-inch", the way specifications are written.
+        if cased.lower() == "inch" and out and out[-1].isdigit():
+            out[-1] = out[-1] + "-inch"
+            continue
+        out.append(cased)
     return " ".join(out) or stem
+
+
+def disambiguate_labels(sources: list[dict]) -> None:
+    """Make every label in a listing unique, in place.
+
+    Vendors reuse one title across many documents — a dozen files all called
+    "MacBook Pro" is a source list you cannot navigate. Where labels
+    collide, the distinguishing part of the filename is appended, so the
+    reader can tell which is which without opening them.
+    """
+    counts: dict[str, int] = {}
+    for item in sources:
+        counts[item["label"]] = counts.get(item["label"], 0) + 1
+    for item in sources:
+        if counts.get(item["label"], 0) < 2:
+            continue
+        hint = readable_label(None, item["path"])
+        label_words = {w.lower() for w in item["label"].split()}
+        extra = [w for w in hint.split() if w.lower() not in label_words]
+        if extra:
+            item["label"] = f"{item['label']} — {' '.join(extra)}"
+
+    # Anything still colliding differs only by its asset code; use it rather
+    # than leave two rows a reader cannot tell apart.
+    still: dict[str, int] = {}
+    for item in sources:
+        still[item["label"]] = still.get(item["label"], 0) + 1
+    for item in sources:
+        if still.get(item["label"], 0) > 1:
+            stem = Path(item["path"]).stem.split("_")[0].split("-")[0]
+            item["label"] = f"{item['label']} ({stem})"
 
 
 def _doc_pairs(raw: list[str] | None) -> list[tuple[str, str]]:
@@ -574,6 +697,7 @@ def make_handler(
                 # collections and moved folders have no readable source.
                 item["has_original"] = bool(roots.get(r["collection"]))
                 sources.append(item)
+            disambiguate_labels(sources)
 
             self._json(
                 200,

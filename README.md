@@ -178,6 +178,8 @@ CDN, because a CDN request would put a network call into a product whose
 guarantee is that nothing leaves the machine. Motion degrades to none if it
 fails to load, and respects `prefers-reduced-motion`.
 
+Uploads take **many files at once** — select or drop a batch and each is queued and indexed in turn, with its own outcome shown. They go one at a time on purpose: every upload re-indexes and takes the database write lock, so parallel uploads would only contend. A file that fails does not stop the batch, and pressing the button again retries only the failures.
+
 **The localhost-only write rule:** upload and thumbs-feedback endpoints exist
 only while the server is bound to a loopback address (the default). Bound to
 anything wider — `--host <tailscale-ip>` to reach it from your phone — every
@@ -319,7 +321,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (295 tests) covers every extractor (including a byte-level
+The suite (311 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on

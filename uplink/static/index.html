@@ -86,16 +86,18 @@
 
     <form id="upload-form" class="upload-form" hidden>
       <label class="drop" id="drop">
-        <input type="file" id="file" hidden>
+        <input type="file" id="file" hidden multiple>
         <span class="drop-icon" aria-hidden="true">⬆</span>
-        <span class="drop-text">Drop a file or <u>browse</u></span>
-        <span class="drop-hint">md · pdf · docx · xlsx · csv · txt</span>
+        <span class="drop-text">Drop files or <u>browse</u></span>
+        <span class="drop-hint">md · pdf · docx · xlsx · csv · txt — select as many as you like</span>
       </label>
       <div class="upload-row">
         <input id="upcoll" type="text" placeholder="collection" autocomplete="off"
-               spellcheck="false" aria-label="Collection for the upload">
-        <button id="upgo" class="btn btn-primary" type="button">Index it</button>
+               spellcheck="false" aria-label="Collection for the uploads">
+        <button id="upgo" class="btn btn-primary" type="button">Index them</button>
+        <button id="upclear" class="mini" type="button" hidden>Clear</button>
       </div>
+      <div id="upqueue" class="upqueue"></div>
       <p id="upmsg" class="micro"></p>
     </form>
   </section>

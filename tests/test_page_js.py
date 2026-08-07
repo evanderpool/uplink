@@ -94,6 +94,11 @@ const postJSON = async () => ({ ok: true });
 const loadNotes = () => {};
 const state = { writes: true, collection: null, sources: [], selected: new Set(),
                 reader: null, pollTimer: null };
+const uploadQueue = [];
+let uploading = false;
+const scheduleMetrics = () => {};
+const loadStatus = async () => {};
+const loadSources = async () => {};
 """
 
 
@@ -585,3 +590,77 @@ def test_metrics_refresh_is_debounced_and_not_self_scheduling():
     assert "loadMetrics()" in src
     body = src[src.index("setTimeout"):]
     assert "scheduleMetrics(" not in body, "the timer must not re-schedule itself"
+
+
+# --------------------------------- multi-file upload queue
+
+def test_upload_accepts_multiple_files():
+    html = (Path(__file__).resolve().parents[1] / "uplink" / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="file"' in html and "multiple" in html.split('id="file"')[1][:60]
+
+
+def test_queue_dedupes_and_reports_count():
+    out = _run(textwrap.dedent("""
+        const files = [{name:"a.pdf", size:10}, {name:"b.pdf", size:20},
+                       {name:"a.pdf", size:10}];
+        const added = queueFiles(files);
+        console.log(JSON.stringify({added: added, queued: uploadQueue.length,
+                                    msg: $("upmsg").textContent}));
+    """), functions=("queueFiles", "renderQueue"))
+    assert out["added"] == 2, "the same file picked twice must queue once"
+    assert out["queued"] == 2
+    assert "2 files ready" in out["msg"]
+
+
+def test_queue_renders_a_row_per_file_with_state():
+    out = _run(textwrap.dedent("""
+        queueFiles([{name:"one.pdf", size:1}, {name:"two.pdf", size:2}]);
+        uploadQueue[0].state = "done"; uploadQueue[0].note = "12 passages";
+        uploadQueue[1].state = "failed"; uploadQueue[1].note = "unsupported file type";
+        renderQueue();
+        const rows = $("upqueue").all((n) => n.className.indexOf("upitem ") === 0
+                                             || /^upitem-/.test(n.className) === false
+                                                && n.className.indexOf("upitem") === 0);
+        console.log(JSON.stringify({text: $("upqueue").textContent}));
+    """), functions=("queueFiles", "renderQueue"))
+    assert "one.pdf" in out["text"] and "12 passages" in out["text"]
+    assert "two.pdf" in out["text"] and "unsupported file type" in out["text"]
+
+
+def test_uploads_are_sequential_not_parallel():
+    """Each upload re-indexes and takes the database write lock, so firing
+    them together would only produce lock contention."""
+    src = _extract("processQueue")
+    assert "for (const item of pending)" in src
+    assert "await uploadOne(" in src
+
+
+def test_a_failed_file_does_not_abort_the_batch():
+    src = _extract("processQueue")
+    assert "catch" in src, "one bad file must not stop the rest"
+    assert 'item.state = "failed"' in src
+
+
+def test_failed_files_are_retried_on_the_next_run():
+    src = _extract("processQueue")
+    assert '"waiting" || q.state === "failed"' in src, (
+        "pressing Index them again should retry what failed"
+    )
+
+
+def test_batch_refreshes_once_not_per_file():
+    """A refresh per file would re-score the live index dozens of times."""
+    src = _extract("processQueue")
+    body = src[src.index("for (const item of pending)"):]
+    loop = body[:body.index("uploading = false")]
+    assert "loadSources()" not in loop and "scheduleMetrics(" not in loop
+    assert "loadSources()" in src and "scheduleMetrics(" in src
+
+
+def test_busy_index_is_retried_once():
+    """503 means a CLI index run holds the write lock — worth one retry
+    rather than failing the file."""
+    src = _extract("uploadOne")
+    assert "503" in src and "await send()" in src

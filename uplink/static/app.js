@@ -1323,6 +1323,106 @@ $("add-source").addEventListener("click", () => {
   if (!form.hidden) anim(form, { opacity: 0, y: -8, duration: 0.32, ease: "power2.out" });
 });
 
+/* ------------------------------------------------------------ upload queue */
+
+// Files are uploaded ONE AT A TIME even though many are selected at once:
+// each upload triggers a re-index that takes the database write lock, so
+// firing them in parallel would only produce lock contention. Sequential
+// also means every file gets its own visible outcome instead of one
+// aggregate success or failure.
+const uploadQueue = [];
+let uploading = false;
+
+function queueFiles(list) {
+  let added = 0;
+  for (const f of list || []) {
+    if (uploadQueue.some((q) => q.file.name === f.name && q.file.size === f.size)) continue;
+    uploadQueue.push({ file: f, state: "waiting", note: "" });
+    added += 1;
+  }
+  renderQueue();
+  if (added) {
+    $("upmsg").textContent = uploadQueue.length +
+      (uploadQueue.length === 1 ? " file ready" : " files ready") + " — press Index them";
+  }
+  return added;
+}
+
+function renderQueue() {
+  const box = $("upqueue");
+  box.replaceChildren();
+  $("upclear").hidden = uploadQueue.length === 0 || uploading;
+  uploadQueue.forEach((item) => {
+    const row = el("div", "upitem upitem-" + item.state);
+    row.appendChild(el("span", "upitem-dot"));
+    row.appendChild(el("span", "upitem-name", item.file.name));
+    row.appendChild(el("span", "upitem-note", item.note || item.state));
+    box.appendChild(row);
+  });
+}
+
+async function uploadOne(item, collection) {
+  const fd = new FormData();
+  fd.append("collection", collection);
+  fd.append("file", item.file);
+  const send = () => fetch("/api/upload", {
+    method: "POST", headers: { "X-Uplink": "1" }, body: fd,
+  });
+  let r = await send();
+  // The indexer holds the write lock for the length of a re-scan; one retry
+  // covers a collision with a CLI index run rather than failing the file.
+  if (r.status === 503) {
+    await new Promise((done) => setTimeout(done, 1500));
+    r = await send();
+  }
+  const data = await r.json().catch(() => ({ error: "bad response" }));
+  if (data.error) {
+    item.state = "failed";
+    item.note = String(data.error).slice(0, 90);
+  } else {
+    item.state = "done";
+    item.note = data.chunks + (data.chunks === 1 ? " passage" : " passages");
+  }
+}
+
+async function processQueue() {
+  const pending = uploadQueue.filter((q) => q.state === "waiting" || q.state === "failed");
+  if (!pending.length) { $("upmsg").textContent = "nothing to index"; return; }
+
+  uploading = true;
+  $("upgo").disabled = true;
+  const collection = $("upcoll").value.trim() || state.collection || "main";
+  let done = 0, failed = 0;
+
+  for (const item of pending) {
+    item.state = "indexing";
+    item.note = "";
+    renderQueue();
+    $("upmsg").textContent = "indexing " + (done + failed + 1) + " of " + pending.length +
+      " into '" + collection + "'\u2026";
+    try {
+      await uploadOne(item, collection);
+    } catch (e) {
+      item.state = "failed";
+      item.note = "upload failed";
+    }
+    if (item.state === "done") done += 1; else failed += 1;
+    renderQueue();
+  }
+
+  uploading = false;
+  $("upgo").disabled = false;
+  $("upmsg").textContent = done + " indexed" +
+    (failed ? ", " + failed + " failed \u2014 press Index them to retry those" : "") +
+    " into '" + collection + "'";
+
+  // One refresh for the whole batch rather than one per file.
+  await loadStatus();
+  await loadSources();
+  scheduleMetrics(200);
+  renderQueue();
+}
+
 $("drop").addEventListener("dragover", (ev) => {
   ev.preventDefault();
   $("drop").classList.add("hot");
@@ -1331,44 +1431,19 @@ $("drop").addEventListener("dragleave", () => $("drop").classList.remove("hot"))
 $("drop").addEventListener("drop", (ev) => {
   ev.preventDefault();
   $("drop").classList.remove("hot");
-  if (ev.dataTransfer && ev.dataTransfer.files.length) {
-    $("file").files = ev.dataTransfer.files;
-    $("upmsg").textContent = ev.dataTransfer.files[0].name + " ready — press Index it";
-  }
+  if (ev.dataTransfer && ev.dataTransfer.files.length) queueFiles(ev.dataTransfer.files);
 });
 $("file").addEventListener("change", () => {
-  const f = $("file").files[0];
-  $("upmsg").textContent = f ? f.name + " ready — press Index it" : "";
+  queueFiles($("file").files);
+  // Clear the input so re-picking the same file still fires a change event.
+  $("file").value = "";
 });
-
-$("upgo").addEventListener("click", async () => {
-  const f = $("file").files[0];
-  if (!f) { $("upmsg").textContent = "choose a file first"; return; }
-  const fd = new FormData();
-  fd.append("collection", $("upcoll").value.trim() || state.collection || "main");
-  fd.append("file", f);
-  $("upgo").disabled = true;
-  $("upmsg").textContent = "indexing…";
-  try {
-    const r = await fetch("/api/upload", {
-      method: "POST", headers: { "X-Uplink": "1" }, body: fd,
-    });
-    const data = await r.json();
-    $("upmsg").textContent = data.error
-      ? "error: " + data.error
-      : "indexed " + data.saved + " → " + data.collection + " (" + data.chunks + " chunks)";
-    if (!data.error) {
-      $("file").value = "";
-      await loadStatus();
-      await loadSources();
-      await loadMetrics();
-    }
-  } catch (e) {
-    $("upmsg").textContent = "upload failed";
-  } finally {
-    $("upgo").disabled = false;
-  }
+$("upclear").addEventListener("click", () => {
+  uploadQueue.length = 0;
+  renderQueue();
+  $("upmsg").textContent = "";
 });
+$("upgo").addEventListener("click", processQueue);
 
 /* ------------------------------------------------------------------- chrome */
 
