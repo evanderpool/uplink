@@ -138,6 +138,53 @@ def index_folder(
     return stats
 
 
+def forget(db_path: str | Path, collection: str | None = None) -> dict:
+    """Remove a collection from the index — or every collection.
+
+    The counterpart to `index_folder`, which had none: a collection could be
+    created and refreshed but never dropped, so clearing one meant editing
+    the database by hand. Source files on disk are never touched; this
+    removes only what was indexed, along with the collection's recorded
+    corpus root so the name is genuinely free for reuse afterwards.
+    """
+    conn = db.connect_rw(db_path)
+    try:
+        if collection is not None:
+            collection = db.validate_collection(collection)
+            rows = conn.execute(
+                "SELECT id FROM documents WHERE collection = ?", (collection,)
+            ).fetchall()
+            doc_ids = [r["id"] for r in rows]
+            chunks = conn.execute(
+                "SELECT COUNT(*) n FROM chunks c JOIN documents d ON d.id = c.doc_id "
+                "WHERE d.collection = ?", (collection,)
+            ).fetchone()["n"]
+            for doc_id in doc_ids:
+                conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM documents WHERE collection = ?", (collection,))
+            conn.execute("DELETE FROM meta WHERE key = ?", (f"corpus_root:{collection}",))
+            removed = {"collections": [collection] if doc_ids else [],
+                       "documents": len(doc_ids), "chunks": chunks}
+        else:
+            names = [r["collection"] for r in conn.execute(
+                "SELECT DISTINCT collection FROM documents ORDER BY collection")]
+            docs = conn.execute("SELECT COUNT(*) n FROM documents").fetchone()["n"]
+            chunks = conn.execute("SELECT COUNT(*) n FROM chunks").fetchone()["n"]
+            conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM documents")
+            conn.execute("DELETE FROM meta WHERE key LIKE 'corpus_root:%'")
+            removed = {"collections": names, "documents": docs, "chunks": chunks}
+
+        conn.commit()
+        # Rebuild the FTS index rather than leave tombstones behind, so a
+        # cleared database is genuinely empty and not merely hidden.
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        conn.commit()
+    finally:
+        conn.close()
+    return removed
+
+
 def _index_file(
     conn: sqlite3.Connection, collection: str, rel: str, path: Path, stats: IndexStats
 ) -> None:

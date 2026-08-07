@@ -99,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
     p_asks.add_argument("--db", default=str(DEFAULT_DB))
     p_asks.add_argument("--json", action="store_true", dest="as_json")
 
+    p_forget = sub.add_parser(
+        "forget", help="Remove a collection (or everything) from the index."
+    )
+    p_forget.add_argument("--db", default=str(DEFAULT_DB))
+    p_forget.add_argument("--collection", default=None,
+                          help="Collection to remove. Omit with --all to clear everything.")
+    p_forget.add_argument("--all", action="store_true", dest="every",
+                          help="Remove EVERY collection.")
+    p_forget.add_argument("--yes", action="store_true",
+                          help="Required. Confirms the removal is intended.")
+
     p_upgrade = sub.add_parser(
         "upgrade", help="Upgrade a v0.1 index to the collections schema (in place)."
     )
@@ -148,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "status":
             return _cmd_status(args)
+        if args.cmd == "forget":
+            return _cmd_forget(args)
         if args.cmd == "upgrade":
             return _cmd_upgrade(args)
         if args.cmd == "asks":
@@ -318,6 +331,29 @@ def _cmd_asks(args) -> int:
               f"{safe_for_display(str(req.get('q', '')), 80)}")
         for d in (docs or [])[:10]:
             print(f"      only: {d}")
+    return 0
+
+
+def _cmd_forget(args) -> int:
+    from .indexer import forget
+
+    if not args.every and not args.collection:
+        raise ValueError("name a --collection, or pass --all to clear everything")
+    if args.every and args.collection:
+        raise ValueError("--all and --collection are mutually exclusive")
+    if not args.yes:
+        # Deleting an index is quick to do and slow to undo; make the intent
+        # explicit rather than inferred from a typo.
+        raise ValueError("refusing without --yes (this deletes indexed data)")
+
+    removed = forget(args.db, None if args.every else args.collection)
+    if not removed["documents"]:
+        print("nothing to remove")
+        return 0
+    print(f"removed {removed['documents']} documents / {removed['chunks']} passages")
+    for name in removed["collections"]:
+        print(f"  dropped collection: {name}")
+    print("source files on disk were not touched")
     return 0
 
 

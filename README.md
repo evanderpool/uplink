@@ -104,6 +104,8 @@ python -m uplink status                                           # index statis
 python -m uplink export --collection ops --out ops.jsonl          # docs+chunks as JSONL
 python -m uplink promote                                          # feedback -> fixtures
 python -m uplink asks                                             # questions waiting for the brain
+python -m uplink forget --collection ops --yes                    # drop a collection from the index
+python -m uplink forget --all --yes                               # clear the index (files untouched)
 python -m uplink upgrade --db old.db                              # v0.1 -> collections schema
 ```
 
@@ -317,7 +319,7 @@ content, so the capability is public but your outputs are not.
 python -m pytest tests -q
 ```
 
-The suite (282 tests) covers every extractor (including a byte-level
+The suite (295 tests) covers every extractor (including a byte-level
 generated PDF — no PDF library needed to test), chunker no-loss properties,
 incremental indexing, deletion purging, read-only enforcement (including
 hostile `#`/`%` database paths), unicode queries and piped-console output on
